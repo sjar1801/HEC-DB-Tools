@@ -1,0 +1,11 @@
+# PyRevit runtime logs
+.logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
