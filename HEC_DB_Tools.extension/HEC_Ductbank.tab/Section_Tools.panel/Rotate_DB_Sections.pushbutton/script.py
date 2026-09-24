@@ -197,13 +197,18 @@ else:
                 print("  WARNING: No facing for {} — will skip".format(tag))
                 continue
 
+            # FacingOrientation points AWAY from the viewer (the direction the panel
+            # face pushes outward). A section must look in the OPPOSITE direction to
+            # see the face from the front — so we negate it here.
+            n = XYZ(-facing.X, -facing.Y, -facing.Z)
+
             # Panel location point (for move step)
             try:
                 loc_pt = elem.Location.Point
             except Exception:
                 loc_pt = None
 
-            panel_map[tag] = (elem, facing, loc_pt)
+            panel_map[tag] = (elem, n, loc_pt)
 
         print("Panels with facing data: {}".format(len(panel_map)))
 
