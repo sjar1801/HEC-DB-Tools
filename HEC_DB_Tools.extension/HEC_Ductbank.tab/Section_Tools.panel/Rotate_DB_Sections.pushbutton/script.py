@@ -216,11 +216,17 @@ else:
             print("ERROR: No panels with Comments IDs and facing data found.")
             print("Run Tool 1 (Assign Panel IDs) then Tool 2 (Create Sections) first.")
         else:
-            # ── Collect section views named "Panel-XXX" in this assembly ──
+            # ── Collect section views named "Panel-XXX" in THIS assembly ──
+            # Scoped by AssociatedAssemblyInstanceId so DB-2 never picks up
+            # DB-1's views (both assemblies use the same Panel-001 … names).
             all_views = FilteredElementCollector(doc).OfClass(View).ToElements()
             section_views = []
             for v in all_views:
                 if v.IsTemplate:
+                    continue
+                if not hasattr(v, "AssociatedAssemblyInstanceId"):
+                    continue
+                if v.AssociatedAssemblyInstanceId != assembly_id:
                     continue
                 if v.Name in panel_map:
                     section_views.append(v)

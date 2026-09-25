@@ -137,10 +137,20 @@ def choose_section_orientation(panel, asm_transform):
         return AssemblyDetailViewOrientation.DetailSectionB, "B({})".format(label), is_angled
 
 
-def section_exists(name):
-    """Return True if a view with this name already exists in the project."""
+def section_exists(name, assembly_id):
+    """Return True if a view with this name already exists IN THIS ASSEMBLY.
+
+    Scoped to the assembly so running on DB-2 never matches DB-1's views
+    (both start from Panel-001, Panel-002 … but belong to different assemblies).
+    """
     for v in FilteredElementCollector(doc).OfClass(View):
-        if not v.IsTemplate and v.Name == name:
+        if v.IsTemplate:
+            continue
+        if v.Name != name:
+            continue
+        if not hasattr(v, "AssociatedAssemblyInstanceId"):
+            continue
+        if v.AssociatedAssemblyInstanceId == assembly_id:
             return True
     return False
 
@@ -238,9 +248,9 @@ else:
                     BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS).AsString()
                 fname = safe_family_name(panel)
 
-                # Skip if section with this name already exists
-                if section_exists(tag):
-                    print("  SKIP: View '{}' already exists".format(tag))
+                # Skip if section with this name already exists IN THIS ASSEMBLY
+                if section_exists(tag, assembly_id):
+                    print("  SKIP: View '{}' already exists in this assembly".format(tag))
                     continue
 
                 try:
@@ -307,8 +317,8 @@ else:
             plan_detail = None
             plan_name   = "Plan Detail"
 
-            if section_exists(plan_name):
-                print("  SKIP: '{}' already exists".format(plan_name))
+            if section_exists(plan_name, assembly_id):
+                print("  SKIP: '{}' already exists in this assembly".format(plan_name))
             else:
                 try:
                     plan_detail = AssemblyViewUtils.CreateDetailSection(
