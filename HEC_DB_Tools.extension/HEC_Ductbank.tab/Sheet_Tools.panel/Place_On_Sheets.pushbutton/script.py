@@ -38,10 +38,26 @@ from Autodesk.Revit.DB import (
     AssemblyViewUtils,
     Viewport,
     View,
+    ViewSection,
     XYZ,
 )
 
-from pyrevit import forms
+clr.AddReference("RevitAPIUI")
+from Autodesk.Revit.UI import TaskDialog
+
+# Windows Forms for the pick-list dialog (pyrevit.forms is IronPython-only and
+# raises "not supported under CPython", so we use .NET WinForms directly).
+try:
+    clr.AddReference("System.Windows.Forms")
+    clr.AddReference("System.Drawing")
+    from System.Windows.Forms import (
+        Form, ListBox, Button, Label, DialogResult, FormStartPosition,
+        FormBorderStyle, AnchorStyles, SelectionMode,
+    )
+    from System.Drawing import Point, Size
+    WINFORMS_OK = True
+except Exception:
+    WINFORMS_OK = False
 
 # ── Layout constants ─────────────────────────────────────────────────────────
 # All values in FEET (Revit internal units). Tune to match your title block.
@@ -62,6 +78,119 @@ SHEET_SUFFIX = "Panel Builds"
 uidoc = __revit__.ActiveUIDocument          # noqa: F821
 doc   = uidoc.Document
 # ───────────────────────────────────────────────────────────────────────────
+
+
+# ── UI HELPERS (CPython-safe — no pyrevit.forms) ────────────────────────────
+
+def alert(msg, title="HEC Place On Sheets"):
+    """Modal message box via Revit TaskDialog (works under CPython)."""
+    try:
+        TaskDialog.Show(title, msg)
+    except Exception:
+        print("[{}] {}".format(title, msg))
+
+
+def select_from_list(labels, title, button_text="OK"):
+    """Show a single-select list dialog. Returns chosen label or None.
+
+    Uses .NET Windows Forms directly. If WinForms is unavailable for some
+    reason, falls back to a TaskDialog with command links (max 4 items) or
+    auto-picks when there is only one option.
+    """
+    labels = list(labels)
+    if not labels:
+        return None
+    if len(labels) == 1:
+        return labels[0]
+
+    if WINFORMS_OK:
+        result = {"value": None}
+
+        form = Form()
+        form.Text = title
+        form.StartPosition = FormStartPosition.CenterScreen
+        form.FormBorderStyle = FormBorderStyle.Sizable
+        form.MinimizeBox = False
+        form.MaximizeBox = False
+        form.ClientSize = Size(520, 380)
+        form.TopMost = True
+
+        lbl = Label()
+        lbl.Text = "Select one item and click '{}':".format(button_text)
+        lbl.Location = Point(12, 10)
+        lbl.AutoSize = True
+        form.Controls.Add(lbl)
+
+        lb = ListBox()
+        lb.Location = Point(12, 32)
+        lb.Size = Size(496, 290)
+        lb.SelectionMode = SelectionMode.One
+        lb.Anchor = (AnchorStyles.Top | AnchorStyles.Bottom |
+                     AnchorStyles.Left | AnchorStyles.Right)
+        for item in labels:
+            lb.Items.Add(item)
+        lb.SelectedIndex = 0
+        form.Controls.Add(lb)
+
+        def on_ok(sender, args):
+            if lb.SelectedItem is not None:
+                result["value"] = str(lb.SelectedItem)
+                form.DialogResult = DialogResult.OK
+                form.Close()
+
+        def on_cancel(sender, args):
+            result["value"] = None
+            form.DialogResult = DialogResult.Cancel
+            form.Close()
+
+        ok = Button()
+        ok.Text = button_text
+        ok.Size = Size(180, 30)
+        ok.Location = Point(12, 336)
+        ok.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+        ok.Click += on_ok
+        form.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Size = Size(100, 30)
+        cancel.Location = Point(408, 336)
+        cancel.Anchor = AnchorStyles.Bottom | AnchorStyles.Right
+        cancel.Click += on_cancel
+        form.Controls.Add(cancel)
+
+        # Double-click an item = OK
+        lb.DoubleClick += on_ok
+
+        form.AcceptButton = ok
+        form.CancelButton = cancel
+        form.ShowDialog()
+        return result["value"]
+
+    # Fallback: TaskDialog command links (first 4 only)
+    from Autodesk.Revit.UI import TaskDialogCommandLinkId, TaskDialogResult
+    td = TaskDialog(title)
+    td.MainInstruction = title
+    link_ids = [TaskDialogCommandLinkId.CommandLink1,
+                TaskDialogCommandLinkId.CommandLink2,
+                TaskDialogCommandLinkId.CommandLink3,
+                TaskDialogCommandLinkId.CommandLink4]
+    shown = labels[:4]
+    for i, item in enumerate(shown):
+        td.AddCommandLink(link_ids[i], item)
+    if len(labels) > 4:
+        td.MainContent = ("Only the first 4 of {} options are shown. "
+                          "Cancel and purge unused families to shorten "
+                          "the list.").format(len(labels))
+    td.CommonButtons = 0
+    td.AllowCancellation = True
+    res = td.Show()
+    results = [TaskDialogResult.CommandLink1, TaskDialogResult.CommandLink2,
+               TaskDialogResult.CommandLink3, TaskDialogResult.CommandLink4]
+    for i, r in enumerate(results[:len(shown)]):
+        if res == r:
+            return shown[i]
+    return None
 
 
 # ── HELPERS ─────────────────────────────────────────────────────────────────
@@ -102,11 +231,10 @@ def pick_title_block():
         option_map[label] = fs
 
     labels = sorted(option_map.keys())
-    chosen = forms.SelectFromList.show(
+    chosen = select_from_list(
         labels,
         title="Select Title Block for Panel Build sheets",
-        multiselect=False,
-        button_name="Use this title block",
+        button_text="Use this title block",
     )
     if not chosen:
         return None
@@ -169,11 +297,10 @@ def pick_assembly():
         label = "{}  (id {})".format(nm, a.Id.IntegerValue)
         option_map[label] = a
 
-    chosen = forms.SelectFromList.show(
+    chosen = select_from_list(
         sorted(option_map.keys()),
         title="Select the ductbank assembly to document",
-        multiselect=False,
-        button_name="Place sections for this assembly",
+        button_text="Place sections for this assembly",
     )
     if not chosen:
         return None
@@ -187,14 +314,16 @@ def collect_section_views(assembly_id):
     so DB-2 never picks up DB-1's views. Sorted by Name (= panel ID order).
     """
     views = []
-    for v in FilteredElementCollector(doc).OfClass(View).ToElements():
+    for v in FilteredElementCollector(doc).OfClass(ViewSection).ToElements():
         if v.IsTemplate:
             continue
-        if not hasattr(v, "AssociatedAssemblyInstanceId"):
+        try:
+            if v.AssociatedAssemblyInstanceId != assembly_id:
+                continue
+        except Exception:
             continue
-        if v.AssociatedAssemblyInstanceId != assembly_id:
-            continue
-        # Only views that can live on a sheet (sections/details)
+        # ViewSection only → excludes the assembly 3D view, Plan Detail,
+        # schedules, and (critically) the sheets themselves on re-runs.
         views.append(v)
     views.sort(key=lambda x: x.Name)
     return views
@@ -246,24 +375,23 @@ print("── HEC Place On Sheets ──")
 # 1. Title block ------------------------------------------------------------
 tb_id = pick_title_block()
 if tb_id == "NONE_LOADED":
-    forms.alert(
-        "No title blocks are loaded in this project.\n\n"
-        "Load a title block family (e.g. the 30x42 BAER block) and run again.",
-        title="No Title Block", exitscript=True)
+    alert("No title blocks are loaded in this project.\n\n"
+          "Load a title block family (e.g. the 30x42 BAER block) and run again.",
+          "No Title Block")
+    raise SystemExit
 if tb_id is None:
-    forms.alert("Cancelled — no title block selected.",
-                title="Cancelled", exitscript=True)
+    print("Cancelled — no title block selected.")
+    raise SystemExit
 
 # 2. Assembly ---------------------------------------------------------------
 assembly = pick_assembly()
 if assembly == "NONE_IN_MODEL":
-    forms.alert(
-        "No assemblies exist in this model.\n\n"
-        "Create your ductbank assembly first.",
-        title="No Assembly", exitscript=True)
+    alert("No assemblies exist in this model.\n\n"
+          "Create your ductbank assembly first.", "No Assembly")
+    raise SystemExit
 if assembly is None:
-    forms.alert("Cancelled — no assembly selected.",
-                title="Cancelled", exitscript=True)
+    print("Cancelled — no assembly selected.")
+    raise SystemExit
 
 assembly_id = assembly.Id
 try:
@@ -275,10 +403,10 @@ print("Assembly: {}".format(assembly_name))
 # 3. Section views ----------------------------------------------------------
 section_views = collect_section_views(assembly_id)
 if not section_views:
-    forms.alert(
-        "No section views found for assembly:\n  {}\n\n"
-        "Run 'Create DB Sections' (Tool 2) first.".format(assembly_name),
-        title="No Sections", exitscript=True)
+    alert("No section views found for assembly:\n  {}\n\n"
+          "Run 'Create DB Sections' (Tool 2) first.".format(assembly_name),
+          "No Sections")
+    raise SystemExit
 print("Section views to place: {}".format(len(section_views)))
 
 # 4. Usable drawing rectangle ----------------------------------------------
