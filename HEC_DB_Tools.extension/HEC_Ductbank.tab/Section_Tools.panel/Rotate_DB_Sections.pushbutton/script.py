@@ -118,16 +118,39 @@ def find_marker(view):
     Coworker's core technique: the marker element (not the View object) is
     what RotateElement/MoveElement actually operates on in Revit.
 
-    SCOPING (multi-ductbank fix):
-    Multiple assemblies produce views with identical names (Panel-001 …).
-    A project-wide name match would return DB-1's marker when running on DB-2.
-    We scope by PROXIMITY — the correct marker is physically near this view's
-    CropBox origin; markers from other assemblies are far away in model space.
-    When multiple markers share the same name, we pick the closest one.
-    """
-    target_name = view.Name
+    PRIMARY — dependency graph (GetDependentElements):
+      Revit tracks the section marker as a dependent of its View object.
+      This lookup is exact: no name matching, no distance guessing.
+      Completely immune to cross-assembly collisions even when adjacent
+      ductbanks are physically close in the model (proximity fails there).
 
-    # View's cut-plane position in model space — our anchor
+    FALLBACK — proximity to CropBox origin:
+      Used only if GetDependentElements doesn't surface an OST_Viewers element
+      (e.g. older Revit builds or unusual assembly view types).
+      Picks the name-matched marker closest to the view's cut-plane origin.
+    """
+    viewers_cat_id = ElementId(BuiltInCategory.OST_Viewers)
+
+    # ── PRIMARY: dependency graph ─────────────────────────────────────────
+    try:
+        dep_ids = view.GetDependentElements(None)
+        for dep_id in dep_ids:
+            elem = doc.GetElement(dep_id)
+            if elem is None:
+                continue
+            if isinstance(elem, View):
+                continue
+            try:
+                if (elem.Category is not None
+                        and elem.Category.Id == viewers_cat_id):
+                    return elem
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # ── FALLBACK: proximity to CropBox origin ─────────────────────────────
+    target_name = view.Name
     try:
         view_origin = view.CropBox.Transform.Origin
     except Exception:
@@ -145,7 +168,6 @@ def find_marker(view):
         if e.Name != target_name:
             continue
 
-        # If we have a view origin, measure distance for proximity scoping
         if view_origin is not None:
             marker_pt = None
             try:
@@ -153,28 +175,22 @@ def find_marker(view):
                 if hasattr(loc, "Point"):
                     marker_pt = loc.Point
                 elif hasattr(loc, "Curve"):
-                    # Section markers may use LocationCurve — take midpoint
-                    curve = loc.Curve
-                    marker_pt = curve.Evaluate(0.5, True)
+                    marker_pt = loc.Curve.Evaluate(0.5, True)
             except Exception:
                 pass
 
             if marker_pt is not None:
                 dx = marker_pt.X - view_origin.X
                 dy = marker_pt.Y - view_origin.Y
-                dist = math.sqrt(dx * dx + dy * dy)
-                candidates.append((dist, e))
+                candidates.append((math.sqrt(dx * dx + dy * dy), e))
             else:
-                # No locatable position — lowest priority fallback
                 candidates.append((1e12, e))
         else:
-            # No view origin available — accept first name match (original behaviour)
-            return e
+            return e   # no origin to compare — first name match
 
     if not candidates:
         return None
 
-    # Return the closest marker to this view's cut-plane origin
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
