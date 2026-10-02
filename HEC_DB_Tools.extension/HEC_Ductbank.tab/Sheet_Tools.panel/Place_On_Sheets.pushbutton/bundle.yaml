@@ -1,0 +1,4 @@
+title: |-
+  Place
+  On Sheets
+tooltip: Places all section views for the selected assembly onto sheets using size-aware packing. Pick a title block, pick the assembly, and the tool packs each section viewport left-to-right, wrapping rows and overflowing to new "Panel Builds" sheets as needed.
