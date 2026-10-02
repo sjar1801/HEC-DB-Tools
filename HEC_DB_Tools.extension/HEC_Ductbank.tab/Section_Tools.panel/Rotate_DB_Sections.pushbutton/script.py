@@ -113,25 +113,70 @@ def is_angled(n):
 
 
 def find_marker(view):
-    """Find the OST_Viewers marker element whose name matches the view.
-    
-    This is the coworker's core technique:
-    The marker element has a DIFFERENT ElementId than the View object itself.
-    RotateElement/MoveElement on the View object is silently ignored in Revit.
-    RotateElement/MoveElement on the MARKER actually works.
-    
-    Match by Name AND exclude View instances (the view itself is also named
-    the same — we want the non-View element in OST_Viewers).
+    """Find the OST_Viewers marker element for THIS specific section view.
+
+    Coworker's core technique: the marker element (not the View object) is
+    what RotateElement/MoveElement actually operates on in Revit.
+
+    SCOPING (multi-ductbank fix):
+    Multiple assemblies produce views with identical names (Panel-001 …).
+    A project-wide name match would return DB-1's marker when running on DB-2.
+    We scope by PROXIMITY — the correct marker is physically near this view's
+    CropBox origin; markers from other assemblies are far away in model space.
+    When multiple markers share the same name, we pick the closest one.
     """
     target_name = view.Name
+
+    # View's cut-plane position in model space — our anchor
+    try:
+        view_origin = view.CropBox.Transform.Origin
+    except Exception:
+        view_origin = None
+
     collector = (FilteredElementCollector(doc)
                  .OfCategory(BuiltInCategory.OST_Viewers)
                  .WhereElementIsNotElementType()
                  .ToElements())
+
+    candidates = []
     for e in collector:
-        if e.Name == target_name and not isinstance(e, View):
+        if isinstance(e, View):
+            continue
+        if e.Name != target_name:
+            continue
+
+        # If we have a view origin, measure distance for proximity scoping
+        if view_origin is not None:
+            marker_pt = None
+            try:
+                loc = e.Location
+                if hasattr(loc, "Point"):
+                    marker_pt = loc.Point
+                elif hasattr(loc, "Curve"):
+                    # Section markers may use LocationCurve — take midpoint
+                    curve = loc.Curve
+                    marker_pt = curve.Evaluate(0.5, True)
+            except Exception:
+                pass
+
+            if marker_pt is not None:
+                dx = marker_pt.X - view_origin.X
+                dy = marker_pt.Y - view_origin.Y
+                dist = math.sqrt(dx * dx + dy * dy)
+                candidates.append((dist, e))
+            else:
+                # No locatable position — lowest priority fallback
+                candidates.append((1e12, e))
+        else:
+            # No view origin available — accept first name match (original behaviour)
             return e
-    return None
+
+    if not candidates:
+        return None
+
+    # Return the closest marker to this view's cut-plane origin
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def dot(a, b):
