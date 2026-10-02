@@ -374,7 +374,9 @@ print("── HEC Place On Sheets ──")
 
 # 1. Title block ------------------------------------------------------------
 tb_id = pick_title_block()
-if tb_id == "NONE_LOADED":
+# NOTE: never use == between a .NET object and a str under CPython/PythonNet —
+# it dispatches to ElementId.op_Equality and throws. Check the type instead.
+if isinstance(tb_id, str) and tb_id == "NONE_LOADED":
     alert("No title blocks are loaded in this project.\n\n"
           "Load a title block family (e.g. the 30x42 BAER block) and run again.",
           "No Title Block")
@@ -385,7 +387,7 @@ if tb_id is None:
 
 # 2. Assembly ---------------------------------------------------------------
 assembly = pick_assembly()
-if assembly == "NONE_IN_MODEL":
+if isinstance(assembly, str) and assembly == "NONE_IN_MODEL":
     alert("No assemblies exist in this model.\n\n"
           "Create your ductbank assembly first.", "No Assembly")
     raise SystemExit
