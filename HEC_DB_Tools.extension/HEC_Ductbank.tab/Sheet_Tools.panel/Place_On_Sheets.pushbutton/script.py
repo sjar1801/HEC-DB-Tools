@@ -11,8 +11,9 @@ What this tool does:
   - Finds the ductbank assembly (uses your current selection, or prompts)
   - Collects every section view that belongs to that assembly
   - Sorts them by name (= panel ID order)
-  - Packs them onto sheets using SIZE-AWARE layout:
-      * reads each view's real printed size (crop box ÷ view scale)
+  - Packs them onto sheets using PLACE-MEASURE-MOVE layout:
+      * places each viewport at a temp spot, asks Revit for the REAL rendered
+        size (GetBoxOutline + GetLabelOutline), then moves it into position
       * lays viewports left-to-right, wraps to a new row when the row is full
       * starts a new overflow sheet when the current sheet is full
   - Creates sheets with AssemblyViewUtils.CreateSheet() and renames them
@@ -35,6 +36,7 @@ from Autodesk.Revit.DB import (
     BuiltInParameter,
     Transaction,
     ElementId,
+    ElementTransformUtils,
     AssemblyViewUtils,
     Viewport,
     View,
@@ -329,34 +331,34 @@ def collect_section_views(assembly_id):
     return views
 
 
-def get_viewport_size(view):
-    """Return (width_ft, height_ft) of the view as printed on the sheet.
+def measure_viewport(vp):
+    """Return (width, height, center_x, center_y) of a placed Viewport.
 
-    Sheet size = model crop extents ÷ view scale. Falls back to a small
-    default if the crop box can't be read.
+    Uses GetBoxOutline() + GetLabelOutline() — Revit's own rendered sizes,
+    so the result is exact regardless of view scale or crop box quirks.
+    The height is the FULL envelope (view content + title label below).
     """
-    try:
-        crop = view.CropBox
-        model_w = abs(crop.Max.X - crop.Min.X)
-        model_h = abs(crop.Max.Y - crop.Min.Y)
-    except Exception:
-        model_w, model_h = 1.0, 1.0
+    box = vp.GetBoxOutline()            # view content area on sheet
+    bmin, bmax = box.MinimumPoint, box.MaximumPoint
+    x0, y0 = bmin.X, bmin.Y
+    x1, y1 = bmax.X, bmax.Y
 
+    # Include the label strip (title below the viewport)
     try:
-        scale = float(view.Scale)
-        if scale <= 0:
-            scale = 1.0
+        lbl = vp.GetLabelOutline()
+        lmin, lmax = lbl.MinimumPoint, lbl.MaximumPoint
+        x0 = min(x0, lmin.X)
+        y0 = min(y0, lmin.Y)
+        x1 = max(x1, lmax.X)
+        y1 = max(y1, lmax.Y)
     except Exception:
-        scale = 1.0
+        pass  # no label — just use the box
 
-    w = model_w / scale
-    h = model_h / scale
-    # Guard against degenerate zero sizes
-    if w <= 0:
-        w = 0.1
-    if h <= 0:
-        h = 0.1
-    return (w, h)
+    w = x1 - x0
+    h = y1 - y0
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    return (w, h, cx, cy)
 
 
 def rename_sheet(sheet, name):
@@ -419,9 +421,18 @@ usable_y1 = SHEET_H - MARGIN_TOP
 usable_w  = usable_x1 - usable_x0
 usable_h  = usable_y1 - usable_y0
 
-# 5. Pack + place -----------------------------------------------------------
+# 5. Place-measure-move packing ---------------------------------------------
+#
+# Strategy: place each viewport at a TEMP position on the sheet, ask Revit
+# for the REAL rendered size (GetBoxOutline + GetLabelOutline), then move the
+# viewport to its correct grid position. This eliminates all crop-box and
+# view-scale guesswork — Revit tells us the actual footprint.
+#
+# If a viewport won't fit on the current sheet, we delete it from this sheet
+# and push the view to the next sheet's queue.
+
 print("")
-print("── Packing viewports ──")
+print("── Packing viewports (place-measure-move) ──")
 
 t = Transaction(doc, "Place DB Sections on Sheets")
 t.Start()
@@ -435,10 +446,13 @@ try:
 except Exception:
     pass
 
-view_queue   = list(section_views)
-sheet_index  = 0
-placed_total = 0
-skipped_big  = []   # views too large for any sheet
+# Temp placement point — sheet center, far from borders
+TEMP_PT = XYZ(SHEET_W / 2.0, SHEET_H / 2.0, 0)
+
+view_queue     = list(section_views)
+sheet_index    = 0
+placed_total   = 0
+skipped_views  = []   # views that couldn't be placed at all
 created_sheets = []
 
 while view_queue:
@@ -464,51 +478,79 @@ while view_queue:
     placed_this_sheet = 0
 
     for view in view_queue:
-        vp_w, vp_h = get_viewport_size(view)
-
-        # View bigger than the whole usable area → cannot ever fit
-        if vp_w > usable_w or vp_h > usable_h:
-            skipped_big.append((view.Name, vp_w, vp_h))
-            print("  SKIP (too large): {}  ({:.2f} x {:.2f} ft, "
-                  "usable {:.2f} x {:.2f})".format(
-                      view.Name, vp_w, vp_h, usable_w, usable_h))
+        # ── Step A: can we even add this view? ──
+        if not Viewport.CanAddViewToSheet(doc, sheet.Id, view.Id):
+            print("  SKIP: {} — already on another sheet".format(view.Name))
+            skipped_views.append((view.Name, "already placed on a sheet"))
             continue
 
-        # Wrap to a new row if this view won't fit in the current row
-        if (cur_x + vp_w > usable_x1) and (cur_x > usable_x0):
+        # ── Step B: place at temp position so Revit renders it ──
+        try:
+            vp = Viewport.Create(doc, sheet.Id, view.Id, TEMP_PT)
+            doc.Regenerate()
+        except Exception as ex:
+            print("  SKIP: {} — viewport creation failed: {}".format(
+                view.Name, ex))
+            skipped_views.append((view.Name, str(ex)))
+            continue
+
+        # ── Step C: measure the REAL size ──
+        try:
+            vp_w, vp_h, cur_cx, cur_cy = measure_viewport(vp)
+        except Exception:
+            # Fallback: if outline methods fail, use a small default
+            vp_w, vp_h = 0.3, 0.3
+            cur_cx, cur_cy = TEMP_PT.X, TEMP_PT.Y
+
+        print("  measured: {:<16}  {:.3f} x {:.3f} ft".format(
+            view.Name, vp_w, vp_h))
+
+        # ── Step D: too big for the entire usable area? ──
+        if vp_w > usable_w + 0.01 or vp_h > usable_h + 0.01:
+            print("    → TOO LARGE for any sheet ({:.2f}x{:.2f} usable). "
+                  "Removing.".format(usable_w, usable_h))
+            doc.Delete(vp.Id)
+            skipped_views.append((view.Name,
+                "too large: {:.2f}x{:.2f} ft".format(vp_w, vp_h)))
+            continue
+
+        # ── Step E: does it fit in the current row? ──
+        if (cur_x + vp_w > usable_x1 + 0.01) and (cur_x > usable_x0 + 0.01):
+            # wrap to next row
             cur_x = usable_x0
             cur_y -= (row_h + PAD_Y)
             row_h = 0.0
 
-        # Doesn't fit vertically on this sheet → push to next sheet
-        if cur_y - vp_h < usable_y0:
+        # ── Step F: does it fit vertically on this sheet? ──
+        if cur_y - vp_h < usable_y0 - 0.01:
+            # Doesn't fit → delete from this sheet, push to next
+            doc.Delete(vp.Id)
             next_batch.append(view)
+            print("    → overflow to next sheet")
             continue
 
-        center_x = cur_x + vp_w / 2.0
-        center_y = cur_y - vp_h / 2.0
+        # ── Step G: compute target center and move ──
+        target_cx = cur_x + vp_w / 2.0
+        target_cy = cur_y - vp_h / 2.0
+        dx = target_cx - cur_cx
+        dy = target_cy - cur_cy
 
-        try:
-            if Viewport.CanAddViewToSheet(doc, sheet.Id, view.Id):
-                Viewport.Create(
-                    doc, sheet.Id, view.Id, XYZ(center_x, center_y, 0))
-                placed_this_sheet += 1
-                placed_total += 1
-                print("  OK: {:<16} @ ({:.2f}, {:.2f})  size {:.2f} x {:.2f}".format(
-                    view.Name, center_x, center_y, vp_w, vp_h))
-            else:
-                print("  WARNING: cannot add {} to sheet "
-                      "(already placed elsewhere?)".format(view.Name))
-        except Exception as vex:
-            print("  WARNING: viewport failed for {}: {}".format(view.Name, vex))
+        if abs(dx) > 0.001 or abs(dy) > 0.001:
+            ElementTransformUtils.MoveElement(
+                doc, vp.Id, XYZ(dx, dy, 0))
 
+        placed_this_sheet += 1
+        placed_total += 1
+        print("    → placed @ ({:.3f}, {:.3f})".format(target_cx, target_cy))
+
+        # Advance cursor
         cur_x += vp_w + PAD_X
         if vp_h > row_h:
             row_h = vp_h
 
     print("  → {} viewport(s) on this sheet".format(placed_this_sheet))
 
-    # Safety: if nothing got placed and nothing advanced, stop to avoid a loop
+    # Safety: if nothing placed and queue didn't shrink, stop to avoid a loop
     if placed_this_sheet == 0 and len(next_batch) == len(view_queue):
         print("  (nothing placeable remaining — stopping)")
         break
@@ -522,11 +564,10 @@ print("")
 print("═══ DONE ═══")
 print("Sheets created:    {}".format(len(created_sheets)))
 print("Viewports placed:  {}/{}".format(placed_total, len(section_views)))
-if skipped_big:
+if skipped_views:
     print("")
-    print("⚠ {} view(s) too large to fit on any sheet:".format(len(skipped_big)))
-    for nm, w, h in skipped_big:
-        print("    {}  ({:.2f} x {:.2f} ft)".format(nm, w, h))
-    print("  Check the view scale or crop box, or use a larger title block.")
+    print("⚠ {} view(s) could not be placed:".format(len(skipped_views)))
+    for nm, reason in skipped_views:
+        print("    {} — {}".format(nm, reason))
 print("")
 print("Review the sheets in the Project Browser under this assembly.")
