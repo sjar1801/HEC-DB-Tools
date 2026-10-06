@@ -9,21 +9,20 @@ Prerequisites:
 What this tool does:
   - Finds the ductbank assembly (current selection → active view → prompt)
   - Lets you tick which dimensions to place (all on by default):
-      * Row String (Right)     — segmented vertical string through every
-                                 rebar row (nested HEC_NESTED_EF-VSFSP_R
-                                 Top/Bottom refs) with the panel's own
-                                 Top/Bottom as the outer endpoints
-      * Overall Height (Left)  — single dim, panel Top → Bottom
-      * Overall Width (Top)    — single dim, panel Left → Right
+      * Row String        — segmented string through every rebar spacer
+      * Overall Height    — single dim, panel Top → Bottom
+      * Overall Width     — single dim, panel Left → Right
+  - Optionally "Replace existing" — deletes all dims in each view before
+    placing, so re-runs produce a clean slate
+  - AUTO-DETECTS spacer bar orientation:
+      * Bars spread horizontally (same Z)  → row string placed BELOW panel,
+        using each bar's CenterLeftRight ref + panel Left/Right as endpoints
+      * Bars spread vertically (different Z)→ row string placed to the RIGHT,
+        using each bar's CenterFrontBack ref + panel Top/Bottom as endpoints
+  - Spacer bars identified by REFERENCE FINGERPRINT (has BOTH CenterLeftRight
+    AND CenterFrontBack refs), not by family name. Fallback: name ends '_R'.
   - Uses dimension style "ASSEMBLIES - CONTINUOUS - 3/32" - HEC - BLACK"
     (falls back to the first Linear dimension type if it's not loaded)
-  - For every section view in the assembly:
-      1. finds the host panel (the instance with the most sub-components)
-      2. collects the stable references (Strategy A — nested instance refs,
-         confirmed by the Dimension Probe)
-      3. places each ticked dimension, offset from the panel's extents
-      4. SKIPS a dimension type if one already exists on that side of the
-         panel in that view (safe to re-run)
   - Everything runs inside ONE transaction
 
 What this tool does NOT do:
@@ -74,16 +73,19 @@ except Exception:
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 DEFAULT_DIM_TYPE_NAME = 'ASSEMBLIES - CONTINUOUS - 3/32" - HEC - BLACK'
-ROW_FAMILY_NAME       = "HEC_NESTED_EF-VSFSP_R"   # nested rebar rows
 
 DIM_OFFSET   = 0.5     # ft — gap between panel extent and dimension line
 Z_TOLERANCE  = 0.01    # ft — refs closer than this in Z are the same row line
+X_TOLERANCE  = 0.01    # ft — refs closer than this in X are the same column
 SIDE_MARGIN  = 0.05    # ft — how far past panel centre counts as "that side"
 
-OPT_ROW    = "Row String (Right)"
-OPT_HEIGHT = "Overall Height (Left)"
-OPT_WIDTH  = "Overall Width (Top)"
-DIM_OPTIONS = [OPT_ROW, OPT_HEIGHT, OPT_WIDTH]
+OPT_ROW     = "Row String"
+OPT_HEIGHT  = "Overall Height"
+OPT_WIDTH   = "Overall Width"
+OPT_REPLACE = "Replace existing dimensions"
+DIM_OPTIONS = [OPT_ROW, OPT_HEIGHT, OPT_WIDTH, OPT_REPLACE]
+# Indices that are checked by default (first 3 on, Replace off)
+DEFAULT_CHECKED = [True, True, True, False]
 # ───────────────────────────────────────────────────────────────────────────
 
 # ── PyRevit doc access ──────────────────────────────────────────────────────
@@ -103,12 +105,7 @@ def alert(msg, title="HEC Dimension Panels"):
 
 
 def select_from_list(labels, title, button_text="OK"):
-    """Show a single-select list dialog. Returns chosen label or None.
-
-    Uses .NET Windows Forms directly. If WinForms is unavailable for some
-    reason, falls back to a TaskDialog with command links (max 4 items) or
-    auto-picks when there is only one option.
-    """
+    """Show a single-select list dialog. Returns chosen label or None."""
     labels = list(labels)
     if not labels:
         return None
@@ -204,17 +201,22 @@ def select_from_list(labels, title, button_text="OK"):
     return None
 
 
-def select_checked(labels, title, button_text="OK"):
-    """Show a multi-select CheckedListBox dialog (all items ticked by default).
+def select_checked(labels, title, defaults=None, button_text="OK"):
+    """Show a multi-select CheckedListBox dialog.
 
+    *defaults* is a list of bools (same length as *labels*) indicating which
+    items are ticked by default. If not provided, every item starts ticked.
     Returns the list of ticked labels (in original order), or None if the
-    user cancelled. If WinForms is unavailable, returns all labels.
+    user cancelled. If WinForms is unavailable, returns the default-ticked
+    items.
     """
     labels = list(labels)
     if not labels:
         return []
+    if defaults is None:
+        defaults = [True] * len(labels)
     if not WINFORMS_OK:
-        return labels
+        return [l for l, d in zip(labels, defaults) if d]
 
     result = {"value": None}
 
@@ -224,7 +226,7 @@ def select_checked(labels, title, button_text="OK"):
     form.FormBorderStyle = FormBorderStyle.FixedDialog
     form.MinimizeBox = False
     form.MaximizeBox = False
-    form.ClientSize = Size(420, 230)
+    form.ClientSize = Size(420, 260)
     form.TopMost = True
 
     lbl = Label()
@@ -236,10 +238,11 @@ def select_checked(labels, title, button_text="OK"):
 
     clb = CheckedListBox()
     clb.Location = Point(12, 32)
-    clb.Size = Size(396, 140)
+    clb.Size = Size(396, 170)
     clb.CheckOnClick = True
-    for item in labels:
-        clb.Items.Add(item, True)   # checked by default
+    for i, item in enumerate(labels):
+        checked = defaults[i] if i < len(defaults) else True
+        clb.Items.Add(item, checked)
     form.Controls.Add(clb)
 
     def on_ok(sender, args):
@@ -259,14 +262,14 @@ def select_checked(labels, title, button_text="OK"):
     ok = Button()
     ok.Text = button_text
     ok.Size = Size(180, 30)
-    ok.Location = Point(12, 186)
+    ok.Location = Point(12, 218)
     ok.Click += on_ok
     form.Controls.Add(ok)
 
     cancel = Button()
     cancel.Text = "Cancel"
     cancel.Size = Size(100, 30)
-    cancel.Location = Point(308, 186)
+    cancel.Location = Point(308, 218)
     cancel.Click += on_cancel
     form.Controls.Add(cancel)
 
@@ -339,11 +342,7 @@ def pick_assembly():
 
 
 def collect_section_views(assembly_id):
-    """Return every non-template section view that belongs to this assembly.
-
-    Scoped by AssociatedAssemblyInstanceId — same pattern as Tools 2–4 —
-    so DB-2 never picks up DB-1's views. Sorted by Name (= panel ID order).
-    """
+    """Return every non-template section view that belongs to this assembly."""
     views = []
     for v in FilteredElementCollector(doc).OfClass(ViewSection).ToElements():
         if v.IsTemplate:
@@ -366,8 +365,7 @@ def _norm(s):
 def find_dimension_type():
     """Return (DimensionType, used_fallback_bool).
 
-    Looks for DEFAULT_DIM_TYPE_NAME first (whitespace/case-insensitive so
-    'ASSEMBLIES-CONTINUOUS' and 'ASSEMBLIES - CONTINUOUS' both match).
+    Looks for DEFAULT_DIM_TYPE_NAME first (whitespace/case-insensitive).
     Falls back to the first Linear dimension type. Returns (None, False) if
     the project has no linear dimension types at all.
     """
@@ -438,9 +436,8 @@ def comments_of(elem):
 def find_panel_in_view(view):
     """Return the host panel FamilyInstance shown in this section view.
 
-    Same logic as the Dimension Probe: the host panel is the instance with
-    the MOST sub-components. If several hosts are visible, prefer the one
-    whose Comments equals the view name (= the panel this view was made for).
+    The host panel is the instance with the MOST sub-components. If several
+    hosts are visible, prefer the one whose Comments equals the view name.
     """
     collector = (FilteredElementCollector(doc, view.Id)
                  .OfClass(FamilyInstance)
@@ -469,6 +466,22 @@ def get_refs(inst, ref_type):
         return list(inst.GetReferences(ref_type))
     except Exception:
         return []
+
+
+def has_ref(inst, ref_type):
+    """True if the instance has at least one ref of this type."""
+    return len(get_refs(inst, ref_type)) > 0
+
+
+def loc_point(elem):
+    """Return the Location.Point of elem, or None."""
+    try:
+        loc = elem.Location
+        if hasattr(loc, "Point"):
+            return loc.Point
+    except Exception:
+        pass
+    return None
 
 
 def bbox_z(elem):
@@ -531,22 +544,31 @@ def panel_view_extents(panel, view):
 def view_point(view, r, u):
     """Model point at view-space coords (r along Right, u along Up).
 
-    Depth (along ViewDirection) is the view origin's — i.e. on the cut plane,
-    which is exactly where NewDimension expects the dimension line to sit.
+    Depth (along ViewDirection) is the view origin's — i.e. on the cut plane.
     """
     o = view.Origin
     p = vadd(o, vscale(view.RightDirection, r))
     return vadd(p, vscale(view.UpDirection, u))
 
 
+def delete_all_dims_in_view(view):
+    """Delete every Dimension element in *view*. Returns count deleted."""
+    dims = list(FilteredElementCollector(doc, view.Id).OfClass(Dimension))
+    n = 0
+    for d in dims:
+        try:
+            doc.Delete(d.Id)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 def existing_dim_sides(view, ext):
     """Classify dimensions already in this view relative to the panel.
 
-    Returns a set containing any of "right", "left", "top" for each side
-    that already carries a dimension of the matching orientation:
-      - vertical dim   (line ∥ UpDirection)    right of panel centre → "right"
-      - vertical dim                           left of panel centre  → "left"
-      - horizontal dim (line ∥ RightDirection) above panel centre    → "top"
+    Returns a set containing any of "right", "left", "top", "bottom" for each
+    side that already carries a dimension of the matching orientation.
     """
     sides = set()
     if ext is None:
@@ -567,7 +589,8 @@ def existing_dim_sides(view, ext):
             if direction is None:
                 p0 = crv.GetEndPoint(0)
                 p1 = crv.GetEndPoint(1)
-                direction = XYZ(p1.X - p0.X, p1.Y - p0.Y, p1.Z - p0.Z).Normalize()
+                direction = XYZ(p1.X - p0.X, p1.Y - p0.Y,
+                                p1.Z - p0.Z).Normalize()
             mid = crv.Evaluate(0.5, True)
         except Exception:
             continue
@@ -584,22 +607,92 @@ def existing_dim_sides(view, ext):
         elif abs(vdot(direction, right)) > 0.9:      # horizontal string
             if u > u_mid + SIDE_MARGIN:
                 sides.add("top")
+            elif u < u_mid - SIDE_MARGIN:
+                sides.add("bottom")
     return sides
+
+
+# ── SPACER BAR DETECTION (ref-fingerprint first, name-fallback second) ──────
+
+def identify_spacer_bars(panel):
+    """Return list of (FamilyInstance, locPoint) for all spacer bar sub-comps.
+
+    PRIMARY test: has BOTH CenterLeftRight AND CenterFrontBack references.
+    FALLBACK: family name ends with '_R'.
+    Returns [] if no sub-components or no bars found.
+    """
+    try:
+        sub_ids = list(panel.GetSubComponentIds())
+    except Exception:
+        return []
+    if not sub_ids:
+        return []
+
+    primary = []
+    fallback = []
+
+    for sid in sub_ids:
+        el = doc.GetElement(sid)
+        if not isinstance(el, FamilyInstance):
+            continue
+        pt = loc_point(el)
+        if pt is None:
+            continue
+
+        has_clr = has_ref(el, FamilyInstanceReferenceType.CenterLeftRight)
+        has_cfb = has_ref(el, FamilyInstanceReferenceType.CenterFrontBack)
+        if has_clr and has_cfb:
+            primary.append((el, pt))
+        else:
+            # Name fallback
+            fname = safe_family_name(el) or ""
+            if fname.endswith("_R"):
+                fallback.append((el, pt))
+
+    if primary:
+        return primary
+    return fallback
+
+
+def detect_orientation(bars):
+    """Determine whether spacer bars run horizontally or vertically.
+
+    Compares the spread of the bars' location-Z values (vertical spread)
+    versus their location-X/Y projected spread (horizontal spread).
+
+    Returns "vertical"  if bars stack in Z  (row string goes on the right)
+            "horizontal" if bars spread in X/Y (row string goes on the bottom)
+            None         if undetermined (0 or 1 bar)
+    """
+    if len(bars) < 2:
+        return None
+
+    zs = [pt.Z for _, pt in bars]
+    xs = [pt.X for _, pt in bars]
+    ys = [pt.Y for _, pt in bars]
+
+    z_spread = max(zs) - min(zs)
+    x_spread = max(xs) - min(xs)
+    y_spread = max(ys) - min(ys)
+    horiz_spread = max(x_spread, y_spread)
+
+    if z_spread < Z_TOLERANCE and horiz_spread > Z_TOLERANCE:
+        return "horizontal"
+    if z_spread > Z_TOLERANCE:
+        return "vertical"
+    return None
 
 
 # ── REFERENCE COLLECTION (Strategy A) ───────────────────────────────────────
 
-def collect_row_string_refs(panel):
-    """Return (refs_sorted_by_z, notes) for the row string.
+def collect_row_refs_vertical(panel, bars):
+    """Row string for VERTICAL orientation (bars stacked in Z).
 
-    Gathers Top/Bottom refs of every nested ROW_FAMILY_NAME instance plus the
-    host panel's Top/Bottom (outer endpoints). Each ref is tagged with its Z
-    (from the instance bounding box). Sorted by Z, then de-duplicated so two
-    refs within Z_TOLERANCE collapse to one — the panel's own refs win ties
-    so the string always ends exactly on the panel faces.
+    Uses each bar's CenterFrontBack ref (one point per bar), with the host
+    panel's Top/Bottom as outer endpoints.  Returns (refs_sorted_by_z, notes).
     """
     notes = []
-    tagged = []   # (z, priority, ref)   priority 0 = panel, 1 = nested
+    tagged = []   # (z, priority, ref)   priority 0 = panel, 1 = bar
 
     # Host panel outer endpoints
     p_zmin, p_zmax = bbox_z(panel)
@@ -614,40 +707,100 @@ def collect_row_string_refs(panel):
     else:
         notes.append("panel Bottom ref missing")
 
-    # Nested rebar rows
-    try:
-        sub_ids = list(panel.GetSubComponentIds())
-    except Exception:
-        sub_ids = []
-
-    rows = 0
-    for sid in sub_ids:
-        el = doc.GetElement(sid)
-        if not isinstance(el, FamilyInstance):
-            continue
-        if safe_family_name(el) != ROW_FAMILY_NAME:
-            continue
-        rows += 1
-        zmin, zmax = bbox_z(el)
-        top = get_refs(el, FamilyInstanceReferenceType.Top)
-        bot = get_refs(el, FamilyInstanceReferenceType.Bottom)
-        if top and zmax is not None:
-            tagged.append((zmax, 1, top[0]))
-        if bot and zmin is not None:
-            tagged.append((zmin, 1, bot[0]))
-
-    if rows == 0:
-        notes.append("no {} rows found".format(ROW_FAMILY_NAME))
+    # Each bar's CenterFrontBack = one horizontal plane per bar
+    for el, pt in bars:
+        cfb = get_refs(el, FamilyInstanceReferenceType.CenterFrontBack)
+        if cfb:
+            tagged.append((pt.Z, 1, cfb[0]))
+        else:
+            notes.append("bar id {} missing CenterFrontBack ref".format(
+                el.Id.IntegerValue))
 
     # Sort by Z, panel refs first on ties, then collapse near-coincident Z
     tagged.sort(key=lambda t: (t[0], t[1]))
     deduped = []
     for z, pri, ref in tagged:
         if deduped and abs(z - deduped[-1][0]) < Z_TOLERANCE:
+            # keep the higher-priority (lower number) one
+            if pri < deduped[-1][1]:
+                deduped[-1] = (z, pri, ref)
             continue
         deduped.append((z, pri, ref))
 
-    return [t[2] for t in deduped], rows, notes
+    return [t[2] for t in deduped], notes
+
+
+def collect_row_refs_horizontal(panel, bars, view):
+    """Row string for HORIZONTAL orientation (bars spread along X/Y).
+
+    Uses each bar's CenterLeftRight ref (one vertical plane per bar), with the
+    host panel's Left/Right as outer endpoints. References are sorted by their
+    projected position along the VIEW's RightDirection so the ordering matches
+    the on-screen left-to-right arrangement regardless of model orientation.
+    Returns (refs_sorted_by_view_right, notes).
+    """
+    notes = []
+    tagged = []   # (r_position, priority, ref)
+
+    right_dir = view.RightDirection
+    origin    = view.Origin
+
+    def project_r(pt):
+        """Dot product of (pt - origin) onto view.RightDirection."""
+        return vdot(XYZ(pt.X - origin.X, pt.Y - origin.Y,
+                        pt.Z - origin.Z), right_dir)
+
+    # Host panel outer endpoints
+    p_left  = get_refs(panel, FamilyInstanceReferenceType.Left)
+    p_right = get_refs(panel, FamilyInstanceReferenceType.Right)
+
+    # Get panel extents for Left/Right positions
+    try:
+        bb = panel.get_BoundingBox(None)
+    except Exception:
+        bb = None
+    if bb is None:
+        notes.append("panel bbox unreadable")
+        return [], notes
+
+    # Project all 8 bbox corners to find the min/max along view Right
+    corners_r = []
+    for x in (bb.Min.X, bb.Max.X):
+        for y in (bb.Min.Y, bb.Max.Y):
+            for z in (bb.Min.Z, bb.Max.Z):
+                corners_r.append(project_r(XYZ(x, y, z)))
+    r_min = min(corners_r)
+    r_max = max(corners_r)
+
+    if p_left:
+        tagged.append((r_min, 0, p_left[0]))
+    else:
+        notes.append("panel Left ref missing")
+    if p_right:
+        tagged.append((r_max, 0, p_right[0]))
+    else:
+        notes.append("panel Right ref missing")
+
+    # Each bar's CenterLeftRight = one vertical plane per bar
+    for el, pt in bars:
+        clr_refs = get_refs(el, FamilyInstanceReferenceType.CenterLeftRight)
+        if clr_refs:
+            tagged.append((project_r(pt), 1, clr_refs[0]))
+        else:
+            notes.append("bar id {} missing CenterLeftRight ref".format(
+                el.Id.IntegerValue))
+
+    # Sort by projected R position, panel refs first on ties
+    tagged.sort(key=lambda t: (t[0], t[1]))
+    deduped = []
+    for r, pri, ref in tagged:
+        if deduped and abs(r - deduped[-1][0]) < X_TOLERANCE:
+            if pri < deduped[-1][1]:
+                deduped[-1] = (r, pri, ref)
+            continue
+        deduped.append((r, pri, ref))
+
+    return [t[2] for t in deduped], notes
 
 
 def make_ref_array(refs):
@@ -680,6 +833,7 @@ print("Assembly: {}".format(assembly_name))
 # 2. Which dimensions? ------------------------------------------------------
 picked = select_checked(DIM_OPTIONS,
                         title="HEC Dimension Panels — choose dimensions",
+                        defaults=DEFAULT_CHECKED,
                         button_text="Place dimensions")
 if picked is None:
     alert("Cancelled — no dimensions selected.", title="Cancelled")
@@ -688,10 +842,16 @@ if not picked:
     alert("Nothing ticked — no dimensions to place.", title="Nothing to do")
     raise SystemExit
 
-do_row    = OPT_ROW    in picked
-do_height = OPT_HEIGHT in picked
-do_width  = OPT_WIDTH  in picked
-print("Dimensions to place: {}".format(", ".join(picked)))
+do_row     = OPT_ROW     in picked
+do_height  = OPT_HEIGHT  in picked
+do_width   = OPT_WIDTH   in picked
+do_replace = OPT_REPLACE in picked
+
+dim_labels = [p for p in picked if p != OPT_REPLACE]
+print("Dimensions to place: {}".format(", ".join(dim_labels) if dim_labels
+                                       else "(none)"))
+if do_replace:
+    print("Replace mode: ON — existing dimensions will be deleted first")
 
 # 3. Dimension type ---------------------------------------------------------
 dim_type, used_fallback = find_dimension_type()
@@ -720,6 +880,7 @@ print("── Placing dimensions ──")
 # 5. Place ------------------------------------------------------------------
 placed_row = placed_h = placed_w = 0
 skipped_row = skipped_h = skipped_w = 0
+replaced_count = 0
 no_panel = []
 errors = 0
 
@@ -736,39 +897,90 @@ for view in section_views:
 
     ext = panel_view_extents(panel, view)
     if ext is None:
-        print("  {:<14} could not read panel bounding box — skipped".format(tag))
+        print("  {:<14} could not read panel bounding box — skipped".format(
+            tag))
         errors += 1
         continue
 
-    have = existing_dim_sides(view, ext)
+    # Replace mode: delete existing dims before placement
+    if do_replace:
+        n_del = delete_all_dims_in_view(view)
+        if n_del:
+            replaced_count += n_del
+        have = set()   # everything cleared
+    else:
+        have = existing_dim_sides(view, ext)
+
     parts = []
 
-    # ── Row String (right) ────────────────────────────────────────────────
+    # ── Row String ────────────────────────────────────────────────────────
     if do_row:
-        if "right" in have:
-            skipped_row += 1
-            parts.append("row: exists")
-        else:
-            refs, rows, notes = collect_row_string_refs(panel)
-            if len(refs) < 2:
-                parts.append("row: too few refs ({})".format(len(refs)))
-                errors += 1
+        bars = identify_spacer_bars(panel)
+        orientation = detect_orientation(bars)
+
+        if not bars:
+            parts.append("row: no spacer bars found — skipped")
+        elif orientation == "vertical":
+            # Bars stack in Z → dim string on the RIGHT
+            if "right" in have:
+                skipped_row += 1
+                parts.append("row(R): exists")
             else:
-                try:
-                    r = ext["r_max"] + DIM_OFFSET
-                    line = Line.CreateBound(
-                        view_point(view, r, ext["u_min"]),
-                        view_point(view, r, ext["u_max"]))
-                    doc.Create.NewDimension(view, line, make_ref_array(refs),
-                                            dim_type)
-                    placed_row += 1
-                    parts.append("row: {} segs ({} rows)".format(
-                        len(refs) - 1, rows))
-                except Exception as ex:
-                    errors += 1
-                    parts.append("row: FAILED {}".format(ex))
-            if notes:
-                parts.append("[{}]".format("; ".join(notes)))
+                refs, notes = collect_row_refs_vertical(panel, bars)
+                if len(refs) < 3:
+                    # Need at least 3 refs (top + bar + bottom) for a
+                    # meaningful row string; 2 = just panel endpoints
+                    parts.append("row(R): too few refs ({}) — skipped".format(
+                        len(refs)))
+                else:
+                    try:
+                        r = ext["r_max"] + DIM_OFFSET
+                        line = Line.CreateBound(
+                            view_point(view, r, ext["u_min"]),
+                            view_point(view, r, ext["u_max"]))
+                        doc.Create.NewDimension(view, line,
+                                                make_ref_array(refs),
+                                                dim_type)
+                        placed_row += 1
+                        parts.append("row(R): {} segs ({} bars)".format(
+                            len(refs) - 1, len(bars)))
+                    except Exception as ex:
+                        errors += 1
+                        parts.append("row(R): FAILED {}".format(ex))
+                if notes:
+                    parts.append("[{}]".format("; ".join(notes)))
+
+        elif orientation == "horizontal":
+            # Bars spread in X/Y → dim string on the BOTTOM
+            if "bottom" in have:
+                skipped_row += 1
+                parts.append("row(B): exists")
+            else:
+                refs, notes = collect_row_refs_horizontal(panel, bars, view)
+                if len(refs) < 3:
+                    parts.append("row(B): too few refs ({}) — skipped".format(
+                        len(refs)))
+                else:
+                    try:
+                        u = ext["u_min"] - DIM_OFFSET
+                        line = Line.CreateBound(
+                            view_point(view, ext["r_min"], u),
+                            view_point(view, ext["r_max"], u))
+                        doc.Create.NewDimension(view, line,
+                                                make_ref_array(refs),
+                                                dim_type)
+                        placed_row += 1
+                        parts.append("row(B): {} segs ({} bars)".format(
+                            len(refs) - 1, len(bars)))
+                    except Exception as ex:
+                        errors += 1
+                        parts.append("row(B): FAILED {}".format(ex))
+                if notes:
+                    parts.append("[{}]".format("; ".join(notes)))
+
+        else:
+            parts.append("row: orientation undetermined ({} bar(s)) "
+                         "— skipped".format(len(bars)))
 
     # ── Overall Height (left) ─────────────────────────────────────────────
     if do_height:
@@ -788,7 +1000,8 @@ for view in section_views:
                         view_point(view, r, ext["u_min"]),
                         view_point(view, r, ext["u_max"]))
                     doc.Create.NewDimension(
-                        view, line, make_ref_array([bot[0], top[0]]), dim_type)
+                        view, line, make_ref_array([bot[0], top[0]]),
+                        dim_type)
                     placed_h += 1
                     parts.append("height: ok")
                 except Exception as ex:
@@ -829,6 +1042,9 @@ t.Commit()
 print("")
 print("═══ DONE ═══")
 print("Views processed:  {}".format(len(section_views)))
+if do_replace and replaced_count:
+    print("Replaced:         {} existing dim(s) deleted".format(
+        replaced_count))
 if do_row:
     print("Row strings:      placed {}  skipped(existing) {}".format(
         placed_row, skipped_row))
