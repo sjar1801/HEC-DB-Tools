@@ -51,20 +51,56 @@ def is_nested_panel(doc, elem):
     return tname in NESTED_PANEL_FAMILIES
 
 
+def has_geometry(elem, tol=0.001):
+    """True if the element has a real (non-degenerate) model bounding box.
+
+    Standard host families always carry their maximum panel count (e.g. 4
+    slots on a straight DB) and hide the unused ones with a family visibility
+    parameter. GetSubComponentIds() still returns those hidden slots, but
+    their bounding box is None or zero-size — so this is the signal we use
+    to skip them (Bug: 20ft DB picking up 4 panels instead of 2).
+    """
+    try:
+        bb = elem.get_BoundingBox(None)
+    except Exception:
+        return False
+    if bb is None:
+        return False
+    try:
+        dx = abs(bb.Max.X - bb.Min.X)
+        dy = abs(bb.Max.Y - bb.Min.Y)
+        dz = abs(bb.Max.Z - bb.Min.Z)
+    except Exception:
+        return False
+    # Degenerate if it has no extent in at least two axes
+    return sum(1 for d in (dx, dy, dz) if d > tol) >= 2
+
+
 def panels_from_host(doc, host, verbose=True):
     """Walk one level into a standard host family and return its nested
     panels. If the host contains no recognised nested panel, the host itself
     is returned as the panel (preserves pre-nesting behaviour for hosts that
-    only contain bars/angles)."""
+    only contain bars/angles).
+
+    Nested panel slots that are hidden/inactive in the family (no geometry)
+    are skipped — see has_geometry()."""
     host_name = safe_family_name(doc, host) or "?"
     found = []
+    skipped = 0
     for se in _sub_elements(doc, host):
         if isinstance(se, FamilyInstance) and is_nested_panel(doc, se):
+            if not has_geometry(se):
+                skipped += 1
+                if verbose:
+                    print("  host {} [{}] -> nested panel {} is inactive (no geometry) — skipped".format(
+                        host.Id, host_name, se.Id))
+                continue
             found.append(se)
     if found:
         if verbose:
-            print("  host {} [{}] -> {} nested panel(s)".format(
-                host.Id, host_name, len(found)))
+            print("  host {} [{}] -> {} nested panel(s){}".format(
+                host.Id, host_name, len(found),
+                " ({} inactive skipped)".format(skipped) if skipped else ""))
         return found
     if verbose:
         print("  host {} [{}] has no nested panel — treating host as panel".format(

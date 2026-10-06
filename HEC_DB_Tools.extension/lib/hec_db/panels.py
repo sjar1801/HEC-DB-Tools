@@ -91,30 +91,42 @@ def assign_panel_ids(doc, active_view):
     # Manual transaction (PyRevit CPython — no TransactionManager)
     t = Transaction(doc, "HEC Assign Panel IDs")
     t.Start()
+    try:
 
-    for i, panel in enumerate(panels):
-        panel_id = PREFIX + str(i + 1).zfill(3)
-        fname = safe_family_name(doc, panel) or ""
-        tname = safe_type_name(panel)
+        for i, panel in enumerate(panels):
+            panel_id = PREFIX + str(i + 1).zfill(3)
+            fname = safe_family_name(doc, panel) or ""
+            tname = safe_type_name(panel)
 
-        # Write to parent panel
-        if write_comment(panel, panel_id, errors, "parent"):
-            tagged += 1
-            print("OK: {} -> {} [{}:{}]".format(panel_id, panel.Id, fname, tname))
+            # Write to parent panel
+            if write_comment(panel, panel_id, errors, "parent"):
+                tagged += 1
+                print("OK: {} -> {} [{}:{}]".format(panel_id, panel.Id, fname, tname))
 
-        # Cascade to nested/sub-components
-        sub_ids = panel.GetSubComponentIds()
-        if sub_ids:
-            for sub_id in sub_ids:
-                sub_elem = doc.GetElement(sub_id)
-                if sub_elem is not None:
-                    if write_comment(sub_elem, panel_id, errors, "nested"):
-                        nested_tagged += 1
-                        sub_fname = safe_family_name(doc, sub_elem) or ""
-                        print("  └─ nested: {} -> {} [{}]".format(
-                            panel_id, sub_elem.Id, sub_fname))
+            # Cascade to nested/sub-components
+            sub_ids = panel.GetSubComponentIds()
+            if sub_ids:
+                for sub_id in sub_ids:
+                    sub_elem = doc.GetElement(sub_id)
+                    if sub_elem is not None:
+                        if write_comment(sub_elem, panel_id, errors, "nested"):
+                            nested_tagged += 1
+                            sub_fname = safe_family_name(doc, sub_elem) or ""
+                            print("  └─ nested: {} -> {} [{}]".format(
+                                panel_id, sub_elem.Id, sub_fname))
 
-    t.Commit()
+        t.Commit()
+    except Exception as ex:
+        # Never leave a transaction open — Revit discards everything and
+        # shows "A transaction or sub-transaction was opened but not closed".
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        print("")
+        print("ERROR — transaction rolled back: {}".format(ex))
+        stats["errors"].append("TRANSACTION ROLLED BACK: {}".format(ex))
+        return stats
 
     print("---")
     print("Panels found: {} | Tagged: {} | Nested tagged: {} | Errors: {}".format(

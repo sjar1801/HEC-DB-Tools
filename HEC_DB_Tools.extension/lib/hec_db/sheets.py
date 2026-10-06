@@ -217,128 +217,141 @@ def place_on_sheets(doc, uidoc, assembly=None, tb_id=None):
 
     t = Transaction(doc, "Place DB Sections on Sheets")
     t.Start()
-
-    # Activate the chosen title block symbol (requires open transaction)
     try:
-        tb_symbol = doc.GetElement(tb_id)
-        if tb_symbol is not None and not tb_symbol.IsActive:
-            tb_symbol.Activate()
-            doc.Regenerate()
-    except Exception:
-        pass
 
-    # Temp placement point — sheet center, far from borders
-    TEMP_PT = XYZ(SHEET_W / 2.0, SHEET_H / 2.0, 0)
-
-    view_queue     = list(section_views)
-    sheet_index    = 0
-    placed_total   = 0
-    skipped_views  = []   # views that couldn't be placed at all
-    created_sheets = []
-
-    while view_queue:
-        sheet_index += 1
-
-        # Create the assembly sheet with the chosen title block
-        sheet = AssemblyViewUtils.CreateSheet(doc, assembly_id, tb_id)
-        doc.Regenerate()
-
-        if sheet_index == 1:
-            sheet_name = "{} — {}".format(assembly_name, SHEET_SUFFIX)
-        else:
-            sheet_name = "{} — {} {}".format(assembly_name, SHEET_SUFFIX, sheet_index)
-        rename_sheet(sheet, sheet_name)
-        created_sheets.append(sheet)
-        print("")
-        print("Sheet {}: {} - {}".format(sheet_index, sheet.SheetNumber, sheet_name))
-
-        cur_x = usable_x0
-        cur_y = usable_y1   # start at top, work downward
-        row_h = 0.0
-        next_batch = []
-        placed_this_sheet = 0
-
-        for view in view_queue:
-            # ── Step A: can we even add this view? ──
-            if not Viewport.CanAddViewToSheet(doc, sheet.Id, view.Id):
-                print("  SKIP: {} — already on another sheet".format(view.Name))
-                skipped_views.append((view.Name, "already placed on a sheet"))
-                continue
-
-            # ── Step B: place at temp position so Revit renders it ──
-            try:
-                vp = Viewport.Create(doc, sheet.Id, view.Id, TEMP_PT)
+        # Activate the chosen title block symbol (requires open transaction)
+        try:
+            tb_symbol = doc.GetElement(tb_id)
+            if tb_symbol is not None and not tb_symbol.IsActive:
+                tb_symbol.Activate()
                 doc.Regenerate()
-            except Exception as ex:
-                print("  SKIP: {} — viewport creation failed: {}".format(
-                    view.Name, ex))
-                skipped_views.append((view.Name, str(ex)))
-                continue
+        except Exception:
+            pass
 
-            # ── Step C: measure the REAL size ──
-            try:
-                vp_w, vp_h, cur_cx, cur_cy = measure_viewport(vp)
-            except Exception:
-                # Fallback: if outline methods fail, use a small default
-                vp_w, vp_h = 0.3, 0.3
-                cur_cx, cur_cy = TEMP_PT.X, TEMP_PT.Y
+        # Temp placement point — sheet center, far from borders
+        TEMP_PT = XYZ(SHEET_W / 2.0, SHEET_H / 2.0, 0)
 
-            print("  measured: {:<16}  {:.3f} x {:.3f} ft".format(
-                view.Name, vp_w, vp_h))
+        view_queue     = list(section_views)
+        sheet_index    = 0
+        placed_total   = 0
+        skipped_views  = []   # views that couldn't be placed at all
+        created_sheets = []
 
-            # ── Step D: too big for the entire usable area? ──
-            if vp_w > usable_w + 0.01 or vp_h > usable_h + 0.01:
-                print("    → TOO LARGE for any sheet ({:.2f}x{:.2f} usable). "
-                      "Removing.".format(usable_w, usable_h))
-                doc.Delete(vp.Id)
-                skipped_views.append((view.Name,
-                    "too large: {:.2f}x{:.2f} ft".format(vp_w, vp_h)))
-                continue
+        while view_queue:
+            sheet_index += 1
 
-            # ── Step E: does it fit in the current row? ──
-            if (cur_x + vp_w > usable_x1 + 0.01) and (cur_x > usable_x0 + 0.01):
-                # wrap to next row
-                cur_x = usable_x0
-                cur_y -= (row_h + PAD_Y)
-                row_h = 0.0
+            # Create the assembly sheet with the chosen title block
+            sheet = AssemblyViewUtils.CreateSheet(doc, assembly_id, tb_id)
+            doc.Regenerate()
 
-            # ── Step F: does it fit vertically on this sheet? ──
-            if cur_y - vp_h < usable_y0 - 0.01:
-                # Doesn't fit → delete from this sheet, push to next
-                doc.Delete(vp.Id)
-                next_batch.append(view)
-                print("    → overflow to next sheet")
-                continue
+            if sheet_index == 1:
+                sheet_name = "{} — {}".format(assembly_name, SHEET_SUFFIX)
+            else:
+                sheet_name = "{} — {} {}".format(assembly_name, SHEET_SUFFIX, sheet_index)
+            rename_sheet(sheet, sheet_name)
+            created_sheets.append(sheet)
+            print("")
+            print("Sheet {}: {} - {}".format(sheet_index, sheet.SheetNumber, sheet_name))
 
-            # ── Step G: compute target center and move ──
-            target_cx = cur_x + vp_w / 2.0
-            target_cy = cur_y - vp_h / 2.0
-            dx = target_cx - cur_cx
-            dy = target_cy - cur_cy
+            cur_x = usable_x0
+            cur_y = usable_y1   # start at top, work downward
+            row_h = 0.0
+            next_batch = []
+            placed_this_sheet = 0
 
-            if abs(dx) > 0.001 or abs(dy) > 0.001:
-                ElementTransformUtils.MoveElement(
-                    doc, vp.Id, XYZ(dx, dy, 0))
+            for view in view_queue:
+                # ── Step A: can we even add this view? ──
+                if not Viewport.CanAddViewToSheet(doc, sheet.Id, view.Id):
+                    print("  SKIP: {} — already on another sheet".format(view.Name))
+                    skipped_views.append((view.Name, "already placed on a sheet"))
+                    continue
 
-            placed_this_sheet += 1
-            placed_total += 1
-            print("    → placed @ ({:.3f}, {:.3f})".format(target_cx, target_cy))
+                # ── Step B: place at temp position so Revit renders it ──
+                try:
+                    vp = Viewport.Create(doc, sheet.Id, view.Id, TEMP_PT)
+                    doc.Regenerate()
+                except Exception as ex:
+                    print("  SKIP: {} — viewport creation failed: {}".format(
+                        view.Name, ex))
+                    skipped_views.append((view.Name, str(ex)))
+                    continue
 
-            # Advance cursor
-            cur_x += vp_w + PAD_X
-            if vp_h > row_h:
-                row_h = vp_h
+                # ── Step C: measure the REAL size ──
+                try:
+                    vp_w, vp_h, cur_cx, cur_cy = measure_viewport(vp)
+                except Exception:
+                    # Fallback: if outline methods fail, use a small default
+                    vp_w, vp_h = 0.3, 0.3
+                    cur_cx, cur_cy = TEMP_PT.X, TEMP_PT.Y
 
-        print("  → {} viewport(s) on this sheet".format(placed_this_sheet))
+                print("  measured: {:<16}  {:.3f} x {:.3f} ft".format(
+                    view.Name, vp_w, vp_h))
 
-        # Safety: if nothing placed and queue didn't shrink, stop to avoid a loop
-        if placed_this_sheet == 0 and len(next_batch) == len(view_queue):
-            print("  (nothing placeable remaining — stopping)")
-            break
+                # ── Step D: too big for the entire usable area? ──
+                if vp_w > usable_w + 0.01 or vp_h > usable_h + 0.01:
+                    print("    → TOO LARGE for any sheet ({:.2f}x{:.2f} usable). "
+                          "Removing.".format(usable_w, usable_h))
+                    doc.Delete(vp.Id)
+                    skipped_views.append((view.Name,
+                        "too large: {:.2f}x{:.2f} ft".format(vp_w, vp_h)))
+                    continue
 
-        view_queue = next_batch
+                # ── Step E: does it fit in the current row? ──
+                if (cur_x + vp_w > usable_x1 + 0.01) and (cur_x > usable_x0 + 0.01):
+                    # wrap to next row
+                    cur_x = usable_x0
+                    cur_y -= (row_h + PAD_Y)
+                    row_h = 0.0
 
-    t.Commit()
+                # ── Step F: does it fit vertically on this sheet? ──
+                if cur_y - vp_h < usable_y0 - 0.01:
+                    # Doesn't fit → delete from this sheet, push to next
+                    doc.Delete(vp.Id)
+                    next_batch.append(view)
+                    print("    → overflow to next sheet")
+                    continue
+
+                # ── Step G: compute target center and move ──
+                target_cx = cur_x + vp_w / 2.0
+                target_cy = cur_y - vp_h / 2.0
+                dx = target_cx - cur_cx
+                dy = target_cy - cur_cy
+
+                if abs(dx) > 0.001 or abs(dy) > 0.001:
+                    ElementTransformUtils.MoveElement(
+                        doc, vp.Id, XYZ(dx, dy, 0))
+
+                placed_this_sheet += 1
+                placed_total += 1
+                print("    → placed @ ({:.3f}, {:.3f})".format(target_cx, target_cy))
+
+                # Advance cursor
+                cur_x += vp_w + PAD_X
+                if vp_h > row_h:
+                    row_h = vp_h
+
+            print("  → {} viewport(s) on this sheet".format(placed_this_sheet))
+
+            # Safety: if nothing placed and queue didn't shrink, stop to avoid a loop
+            if placed_this_sheet == 0 and len(next_batch) == len(view_queue):
+                print("  (nothing placeable remaining — stopping)")
+                break
+
+            view_queue = next_batch
+
+        t.Commit()
+    except Exception as ex:
+        # Never leave a transaction open — Revit discards everything and
+        # shows "A transaction or sub-transaction was opened but not closed".
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        print("")
+        print("ERROR during sheet placement — transaction rolled back: {}".format(ex))
+        stats["status"] = "error"
+        stats["error"] = str(ex)
+        return stats
 
     # ── Summary ───────────────────────────────────────────────────────────
     print("")

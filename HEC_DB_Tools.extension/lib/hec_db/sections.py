@@ -35,6 +35,7 @@ from Autodesk.Revit.DB import (
     ParameterFilterElement,
     ParameterFilterRuleFactory,
     ElementParameterFilter,
+    FilterRule,
     Line,
     View,
     XYZ,
@@ -47,7 +48,7 @@ from hec_db.constants import (
     AIM_TOLERANCE, MOVE_THRESHOLD, ANGLED_THRESHOLD,
 )
 from hec_db.utils import safe_family_name, find_view_template
-from hec_db.assembly import collect_panels
+from hec_db.assembly import collect_panels, is_nested_panel
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -118,10 +119,20 @@ def section_exists(doc, name, assembly_id):
     return False
 
 
-def get_or_create_filter(doc, filter_name, category_id, param_id, value):
-    """Create a NOT-EQUALS ParameterFilterElement for the given string value.
+def get_or_create_filter(doc, filter_name, category_id, param_id, value,
+                         keep_blank=False):
+    """Create a ParameterFilterElement that HIDES everything except *value*.
     Returns the filter ElementId, or None on failure.
     Revit 2025: CreateNotEqualsRule(ElementId, String) — 2-arg form (3-arg is obsolete).
+
+    keep_blank=False (custom DBs — original behaviour):
+        HIDE if  Comments != value
+    keep_blank=True  (standard DBs with nested panels):
+        HIDE if  Comments != value  AND  Comments has a value
+        → the HOST family (blank Comments) stays visible, so Revit does not
+          drag its nested children (including the wanted panel) down with it.
+          Only the sibling nested panels with a different Panel-ID are hidden.
+    Both rules in one ElementParameterFilter = logical AND.
     """
     # Reuse if already exists
     for f in FilteredElementCollector(doc).OfClass(ParameterFilterElement):
@@ -133,8 +144,19 @@ def get_or_create_filter(doc, filter_name, category_id, param_id, value):
 
     try:
         # Revit 2025 2-arg form — no case sensitivity boolean
-        rule = ParameterFilterRuleFactory.CreateNotEqualsRule(param_id, value)
-        elem_filter = ElementParameterFilter(rule)
+        rule_ne = ParameterFilterRuleFactory.CreateNotEqualsRule(param_id, value)
+        if keep_blank:
+            try:
+                rule_has = ParameterFilterRuleFactory.CreateHasValueParameterRule(param_id)
+            except Exception:
+                # Older API fallback: "not equal to empty string"
+                rule_has = ParameterFilterRuleFactory.CreateNotEqualsRule(param_id, "")
+            rules = List[FilterRule]()
+            rules.Add(rule_ne)
+            rules.Add(rule_has)
+            elem_filter = ElementParameterFilter(rules)
+        else:
+            elem_filter = ElementParameterFilter(rule_ne)
         pfe = ParameterFilterElement.Create(doc, filter_name, cats, elem_filter)
         return pfe.Id
     except Exception as ex:
@@ -219,109 +241,131 @@ def create_sections(doc, active_view):
 
     t = Transaction(doc, "HEC Create DB Sections")
     t.Start()
+    try:
 
-    for panel in panels:
-        tag   = panel.get_Parameter(
-            BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS).AsString()
-        fname = safe_family_name(doc, panel)
+        for panel in panels:
+            tag   = panel.get_Parameter(
+                BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS).AsString()
+            fname = safe_family_name(doc, panel)
 
-        # Skip if section with this name already exists IN THIS ASSEMBLY
-        if section_exists(doc, tag, assembly_id):
-            print("  SKIP: View '{}' already exists in this assembly".format(tag))
-            continue
-
-        try:
-            # Choose orientation based on panel facing vs assembly axes
-            orientation, orient_label, is_angled = choose_section_orientation(
-                panel, asm_transform)
-            if orient_label.startswith("A"):
-                a_count += 1
-            else:
-                b_count += 1
-
-            # Create the assembly detail section
-            section_view = AssemblyViewUtils.CreateDetailSection(
-                doc, assembly_id, orientation)
-            doc.Regenerate()
-
-            # Name the view to match the panel ID
-            try:
-                section_view.Name = tag
-            except Exception as name_ex:
-                print("  WARNING: Could not rename view to '{}': {}".format(
-                    tag, name_ex))
-
-            # Add NOT-EQUALS filter (hides all panels EXCEPT this one)
-            filter_name = "HideExcept_{}".format(tag)
-            filter_id = get_or_create_filter(
-                doc, filter_name, elec_fix_cat_id, comments_param_id, tag)
-
-            filter_applied = False
-            if filter_id is not None:
-                try:
-                    section_view.AddFilter(filter_id)
-                    section_view.SetFilterVisibility(filter_id, False)
-                    filter_applied = True
-                except Exception as fex:
-                    print("  WARNING: Filter apply failed for {}: {}".format(
-                        tag, fex))
-
-            # Apply section view template
-            # Note: template may lock filter settings — that's expected
-            if section_template is not None:
-                try:
-                    section_view.ViewTemplateId = section_template.Id
-                    doc.Regenerate()
-                except Exception as tex:
-                    print("  WARNING: Template apply failed for {}: {}".format(
-                        tag, tex))
-
-            section_views.append(section_view)
-
-            status = "  OK: {} | {} | Orient:{} | Filter:{}".format(
-                tag, fname, orient_label,
-                "yes" if filter_applied else "NO")
-            if is_angled:
-                status += " | ⚠ ANGLED"
-            print(status)
-
-        except Exception as ex:
-            print("  ERROR on {}: {}".format(tag, ex))
-
-    # ── Create Plan Detail (HorizontalDetail) ──────────────────────────────
-    print("")
-    print("── Creating Plan Detail ──")
-    plan_detail = None
-    plan_name   = "Plan Detail"
-
-    if section_exists(doc, plan_name, assembly_id):
-        print("  SKIP: '{}' already exists in this assembly".format(plan_name))
-    else:
-        try:
-            plan_detail = AssemblyViewUtils.CreateDetailSection(
-                doc, assembly_id,
-                AssemblyDetailViewOrientation.HorizontalDetail)
-            doc.Regenerate()
+            # Skip if section with this name already exists IN THIS ASSEMBLY
+            if section_exists(doc, tag, assembly_id):
+                print("  SKIP: View '{}' already exists in this assembly".format(tag))
+                continue
 
             try:
-                plan_detail.Name = plan_name
-            except Exception:
-                pass
+                # Choose orientation based on panel facing vs assembly axes
+                orientation, orient_label, is_angled = choose_section_orientation(
+                    panel, asm_transform)
+                if orient_label.startswith("A"):
+                    a_count += 1
+                else:
+                    b_count += 1
 
-            if plan_template is not None:
+                # Create the assembly detail section
+                section_view = AssemblyViewUtils.CreateDetailSection(
+                    doc, assembly_id, orientation)
+                doc.Regenerate()
+
+                # Name the view to match the panel ID
                 try:
-                    plan_detail.ViewTemplateId = plan_template.Id
-                    doc.Regenerate()
-                except Exception as ptex:
-                    print("  WARNING: Plan template apply failed: {}".format(ptex))
+                    section_view.Name = tag
+                except Exception as name_ex:
+                    print("  WARNING: Could not rename view to '{}': {}".format(
+                        tag, name_ex))
 
-            print("  OK: Plan Detail created (ID {})".format(
-                plan_detail.Id.IntegerValue))
+                # Add filter (hides all panels EXCEPT this one).
+                # Nested panels (standard DBs) need the two-rule variant that
+                # leaves the blank-Comments HOST visible — otherwise Revit hides
+                # the host and every nested child with it. Distinct filter name
+                # so it never collides with the single-rule custom-DB filters.
+                nested = is_nested_panel(doc, panel)
+                if nested:
+                    filter_name = "HideExcept_{}_Nested".format(tag)
+                else:
+                    filter_name = "HideExcept_{}".format(tag)
+                filter_id = get_or_create_filter(
+                    doc, filter_name, elec_fix_cat_id, comments_param_id, tag,
+                    keep_blank=nested)
 
-        except Exception as pex:
-            print("  ERROR creating Plan Detail: {}".format(pex))
+                filter_applied = False
+                if filter_id is not None:
+                    try:
+                        section_view.AddFilter(filter_id)
+                        section_view.SetFilterVisibility(filter_id, False)
+                        filter_applied = True
+                    except Exception as fex:
+                        print("  WARNING: Filter apply failed for {}: {}".format(
+                            tag, fex))
 
-    t.Commit()
+                # Apply section view template
+                # Note: template may lock filter settings — that's expected
+                if section_template is not None:
+                    try:
+                        section_view.ViewTemplateId = section_template.Id
+                        doc.Regenerate()
+                    except Exception as tex:
+                        print("  WARNING: Template apply failed for {}: {}".format(
+                            tag, tex))
+
+                section_views.append(section_view)
+
+                status = "  OK: {} | {} | Orient:{} | Filter:{}".format(
+                    tag, fname, orient_label,
+                    "yes" if filter_applied else "NO")
+                if is_angled:
+                    status += " | ⚠ ANGLED"
+                print(status)
+
+            except Exception as ex:
+                print("  ERROR on {}: {}".format(tag, ex))
+
+        # ── Create Plan Detail (HorizontalDetail) ──────────────────────────────
+        print("")
+        print("── Creating Plan Detail ──")
+        plan_detail = None
+        plan_name   = "Plan Detail"
+
+        if section_exists(doc, plan_name, assembly_id):
+            print("  SKIP: '{}' already exists in this assembly".format(plan_name))
+        else:
+            try:
+                plan_detail = AssemblyViewUtils.CreateDetailSection(
+                    doc, assembly_id,
+                    AssemblyDetailViewOrientation.HorizontalDetail)
+                doc.Regenerate()
+
+                try:
+                    plan_detail.Name = plan_name
+                except Exception:
+                    pass
+
+                if plan_template is not None:
+                    try:
+                        plan_detail.ViewTemplateId = plan_template.Id
+                        doc.Regenerate()
+                    except Exception as ptex:
+                        print("  WARNING: Plan template apply failed: {}".format(ptex))
+
+                print("  OK: Plan Detail created (ID {})".format(
+                    plan_detail.Id.IntegerValue))
+
+            except Exception as pex:
+                print("  ERROR creating Plan Detail: {}".format(pex))
+
+        t.Commit()
+    except Exception as ex:
+        # Never leave a transaction open — Revit discards everything and
+        # shows "A transaction or sub-transaction was opened but not closed".
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        print("")
+        print("ERROR — transaction rolled back: {}".format(ex))
+        stats["status"] = "error"
+        stats["error"] = str(ex)
+        return stats
 
     # ── Summary ────────────────────────────────────────────────────────────
     print("")
