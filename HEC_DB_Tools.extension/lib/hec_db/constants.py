@@ -7,13 +7,44 @@ PyRevit v6 + CPython 3123  |  Revit 2025
 Hunt Electric — MONARCH Job
 """
 
-# ── Panel families (Tools 1-4) ──────────────────────────────────────────────
-TARGET_FAMILIES = [
+# ── Panel families (Tools 1-5) ──────────────────────────────────────────────
+# Two kinds of ductbank builds exist in the model:
+#
+#   CUSTOM   — each panel is its own FamilyInstance, a direct assembly member.
+#   STANDARD — Assembly → outer container (HEC_EF-DUCTBANK_STANDARD_*, ignored)
+#                       → host family (HEC_NESTED_EF-DB_*)  ← appears in collectors
+#                           → nested panel (DB_PANEL_*)      ← the real panel
+#
+# Hosts show up directly in FilteredElementCollector / GetMemberIds, but the
+# actual panels are one level down via GetSubComponentIds().
+# Use hec_db.assembly.collect_panels() to get a flat panel list for either kind.
+
+# Tier 1 — custom panels, found directly, treated as individual panels
+CUSTOM_PANEL_FAMILIES = [
     "HEC_EF-DB_SIDE_PANEL",
     "HEC_EF-DB_ASPVSF",
-    "HEC_NESTED_EF-DB_ASP",
-    "HEC_NESTED_EF-DB90_ASP",
 ]
+
+# Tier 2 — standard host families, found directly but CONTAIN the nested panels
+STANDARD_HOST_FAMILIES = [
+    "HEC_NESTED_EF-DB_FSP",
+    "HEC_NESTED_EF-DB_ASP",
+    "HEC_NESTED_EF-DB90_LSSP",
+    "HEC_NESTED_EF-DB90_OASP",
+    "HEC_NESTED_EF-DB90_ASP",
+    "HEC_NESTED_EF-DBHK_LSP",
+]
+
+# Nested panel families that live inside standard hosts
+NESTED_PANEL_FAMILIES = [
+    "DB_PANEL_FIXED",
+    "DB_PANEL_ADJ",
+    "DB90_PANEL_ADJ",
+    "DB90_PANEL_ADJ_MITRED",
+]
+
+# Union — for code that only needs "is this a family we care about?"
+TARGET_FAMILIES = CUSTOM_PANEL_FAMILIES + STANDARD_HOST_FAMILIES
 
 # ── Tool 1: Assign Panel IDs ────────────────────────────────────────────────
 PREFIX     = "Panel-"

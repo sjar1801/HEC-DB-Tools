@@ -17,8 +17,11 @@ from Autodesk.Revit.DB import (
     Transaction,
 )
 
-from hec_db.constants import TARGET_FAMILIES, PREFIX, PARAM_NAME
+from hec_db.constants import (
+    TARGET_FAMILIES, NESTED_PANEL_FAMILIES, PREFIX, PARAM_NAME,
+)
 from hec_db.utils import safe_family_name, safe_type_name
+from hec_db.assembly import collect_panels
 
 
 def write_comment(elem, value, errors, label=""):
@@ -57,18 +60,21 @@ def assign_panel_ids(doc, active_view):
     collector.OfClass(FamilyInstance)
     all_instances = list(collector.ToElements())
 
-    panels = [e for e in all_instances
-              if safe_family_name(doc, e) in TARGET_FAMILIES]
-    stats["panels"] = len(panels)
-
     print("View: {} ({})".format(active_view.Name, active_view.ViewType))
     print("FamilyInstances in view: {}".format(len(all_instances)))
+
+    # Custom panels come back directly; standard hosts are walked one level
+    # down to their nested DB_PANEL_* instances (see hec_db.assembly).
+    panels = collect_panels(doc, all_instances)
+    stats["panels"] = len(panels)
+
     print("Panels matched: {}".format(len(panels)))
     print("---")
 
     if len(panels) == 0:
         print("ERROR: No panels found matching target families.")
         print("Target families: {}".format(TARGET_FAMILIES))
+        print("Nested panel families: {}".format(NESTED_PANEL_FAMILIES))
         seen = set()
         for elem in all_instances[:50]:
             fn = safe_family_name(doc, elem)

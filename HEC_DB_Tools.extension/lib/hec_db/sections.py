@@ -43,10 +43,11 @@ from Autodesk.Revit.DB import (
 from System.Collections.Generic import List
 
 from hec_db.constants import (
-    TARGET_FAMILIES, SECTION_TEMPLATE_NAME, PLAN_TEMPLATE_NAME,
+    SECTION_TEMPLATE_NAME, PLAN_TEMPLATE_NAME,
     AIM_TOLERANCE, MOVE_THRESHOLD, ANGLED_THRESHOLD,
 )
 from hec_db.utils import safe_family_name, find_view_template
+from hec_db.assembly import collect_panels
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -172,18 +173,18 @@ def create_sections(doc, active_view):
     print("Assembly: {}".format(assembly_elem.Name))
 
     # ── Collect panels with Comments assigned ──────────────────────────────
+    # Custom panels are direct members; standard hosts are walked one level
+    # down to their nested panels. Comments IDs live on the panels themselves.
     member_ids = assembly_elem.GetMemberIds()
+    candidates = collect_panels(doc, member_ids, from_assembly=True)
     panels = []
-    for mid in member_ids:
-        elem = doc.GetElement(mid)
-        if elem is None:
-            continue
-        fname = safe_family_name(doc, elem)
-        if fname not in TARGET_FAMILIES:
-            continue
+    for elem in candidates:
         cp = elem.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
         if cp and cp.HasValue and cp.AsString():
             panels.append(elem)
+    if len(candidates) != len(panels):
+        print("  {} panel(s) without Comments ID skipped".format(
+            len(candidates) - len(panels)))
 
     if not panels:
         print("ERROR: No panels with Comments IDs found in this assembly.")
@@ -508,15 +509,12 @@ def rotate_sections(doc, active_view):
     print("Assembly: {}".format(assembly_elem.Name))
 
     # ── Build panel lookup: Comments value → (panel element, FacingOrientation) ──
+    # Custom panels are direct members; standard hosts are walked one level
+    # down to their nested panels (facing/location read from the panel itself).
     member_ids = assembly_elem.GetMemberIds()
     panel_map  = {}   # "Panel-001" → (elem, facing XYZ, loc XYZ)
 
-    for mid in member_ids:
-        elem = doc.GetElement(mid)
-        if elem is None:
-            continue
-        if safe_family_name(doc, elem) not in TARGET_FAMILIES:
-            continue
+    for elem in collect_panels(doc, member_ids, from_assembly=True):
         cp = elem.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
         if not (cp and cp.HasValue and cp.AsString()):
             continue
