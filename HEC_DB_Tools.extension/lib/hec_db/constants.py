@@ -32,6 +32,7 @@ STANDARD_HOST_FAMILIES = [
     "HEC_NESTED_EF-DB90_LSSP",
     "HEC_NESTED_EF-DB90_OASP",
     "HEC_NESTED_EF-DB90_ASP",
+    "HEC_NESTED_EF-DB90_SSSP",
     "HEC_NESTED_EF-DBHK_LSP",
 ]
 
@@ -39,8 +40,10 @@ STANDARD_HOST_FAMILIES = [
 NESTED_PANEL_FAMILIES = [
     "DB_PANEL_FIXED",
     "DB_PANEL_ADJ",
+    "DB90_PANEL_FIXED",
     "DB90_PANEL_ADJ",
     "DB90_PANEL_ADJ_MITRED",
+    "HEC_NESTED_EF-DUCTBANK_PANEL",
 ]
 
 # Union — for code that only needs "is this a family we care about?"

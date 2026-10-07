@@ -1,8 +1,10 @@
 """hec_db.panels — Tool 1: Assign Panel IDs.
 
 Assigns Panel-001, Panel-002, etc. to the Comments parameter on target panel
-families visible in the given view. Cascades the same ID down to
-nested/sub-components.
+families visible in the given view.  Cascades the same ID down to
+nested/sub-components.  After tagging, a second pass stamps every *other*
+assembly member with ``Not A Panel`` so that section-view filters can hide
+non-panel clutter (cards, spare angles, stayform, etc.).
 
 PyRevit v6 + CPython 3123  |  Revit 2025
 Hunt Electric — MONARCH Job
@@ -11,6 +13,7 @@ Hunt Electric — MONARCH Job
 import clr
 clr.AddReference("RevitAPI")
 from Autodesk.Revit.DB import (
+    AssemblyInstance,
     FilteredElementCollector,
     FamilyInstance,
     BuiltInParameter,
@@ -18,10 +21,13 @@ from Autodesk.Revit.DB import (
 )
 
 from hec_db.constants import (
-    TARGET_FAMILIES, NESTED_PANEL_FAMILIES, PREFIX, PARAM_NAME,
+    TARGET_FAMILIES, NESTED_PANEL_FAMILIES,
+    STANDARD_HOST_FAMILIES, PREFIX, PARAM_NAME,
 )
 from hec_db.utils import safe_family_name, safe_type_name
 from hec_db.assembly import collect_panels
+
+NOT_A_PANEL = "Not A Panel"
 
 
 def write_comment(elem, value, errors, label=""):
@@ -47,13 +53,79 @@ def write_comment(elem, value, errors, label=""):
         return False
 
 
+def _read_comment(elem):
+    """Return the current Comments value (str) or ''."""
+    p = elem.LookupParameter(PARAM_NAME)
+    if p is None:
+        p = elem.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+    if p is not None:
+        try:
+            v = p.AsString()
+            return v if v else ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _collect_all_descendants(doc, elem):
+    """Return a set of ElementId.IntegerValue for *elem* and every
+    sub-component recursively (the entire nested tree below it)."""
+    result = set()
+    stack = [elem]
+    while stack:
+        cur = stack.pop()
+        key = cur.Id.IntegerValue
+        if key in result:
+            continue
+        result.add(key)
+        try:
+            for sid in cur.GetSubComponentIds():
+                se = doc.GetElement(sid)
+                if se is not None:
+                    stack.append(se)
+        except Exception:
+            pass
+    return result
+
+
+def _stamp_non_panels(doc, active_view, panel_tree_ids, errors):
+    """Second pass — stamp ``Not A Panel`` on every FamilyInstance in the
+    view that is NOT part of the panel tree (panels + their hosts +
+    sub-components) and does not already carry a Panel-XXX tag.
+
+    Returns the number of elements stamped.
+    """
+    stamped = 0
+    collector = (FilteredElementCollector(doc, active_view.Id)
+                 .OfClass(FamilyInstance)
+                 .WhereElementIsNotElementType())
+    for fi in collector:
+        key = fi.Id.IntegerValue
+        if key in panel_tree_ids:
+            continue
+        existing = _read_comment(fi)
+        if existing.startswith(PREFIX) or existing == NOT_A_PANEL:
+            continue
+        if write_comment(fi, NOT_A_PANEL, errors, "nap"):
+            stamped += 1
+    return stamped
+
+
 def assign_panel_ids(doc, active_view):
     """Tool 1 orchestrator. Tags every target panel visible in *active_view*.
 
-    Manages its own Transaction. Prints progress. Returns a stats dict:
-      {"panels": n, "tagged": n, "nested_tagged": n, "errors": [..]}
+    Two passes inside one Transaction:
+      1. Assign Panel-001 … Panel-NNN to every recognised panel and cascade
+         the ID to sub-components.
+      2. Stamp ``Not A Panel`` on every remaining element in the view that
+         is not part of the panel tree.
+
+    Returns a stats dict:
+      {"panels": n, "tagged": n, "nested_tagged": n,
+       "nap_stamped": n, "errors": [..]}
     """
-    stats = {"panels": 0, "tagged": 0, "nested_tagged": 0, "errors": []}
+    stats = {"panels": 0, "tagged": 0, "nested_tagged": 0,
+             "nap_stamped": 0, "errors": []}
 
     # ── Collect panels in active view ────────────────────────────
     collector = FilteredElementCollector(doc, active_view.Id)
@@ -88,15 +160,31 @@ def assign_panel_ids(doc, active_view):
     nested_tagged = 0
     errors = stats["errors"]
 
+    # Build the "panel tree" — every ElementId that is a panel, a host
+    # containing a panel, or a sub-component of a panel. These should NOT
+    # get the "Not A Panel" stamp.
+    panel_tree_ids = set()
+
     # Manual transaction (PyRevit CPython — no TransactionManager)
     t = Transaction(doc, "HEC Assign Panel IDs")
     t.Start()
     try:
-
+        # ── Pass 1: assign Panel-XXX IDs ─────────────────────────
         for i, panel in enumerate(panels):
             panel_id = PREFIX + str(i + 1).zfill(3)
             fname = safe_family_name(doc, panel) or ""
             tname = safe_type_name(panel)
+
+            # Collect the full descendant tree of this panel
+            panel_tree_ids |= _collect_all_descendants(doc, panel)
+
+            # Also include the host of this panel (if it's a nested panel)
+            try:
+                host = panel.SuperComponent
+                if host is not None:
+                    panel_tree_ids |= _collect_all_descendants(doc, host)
+            except Exception:
+                pass
 
             # Write to parent panel
             if write_comment(panel, panel_id, errors, "parent"):
@@ -115,6 +203,29 @@ def assign_panel_ids(doc, active_view):
                             print("  └─ nested: {} -> {} [{}]".format(
                                 panel_id, sub_elem.Id, sub_fname))
 
+        # Also walk up to any outer containers (HEC_EF-DUCTBANK_STANDARD_*)
+        # that parent the hosts — they should stay blank, not get stamped.
+        for inst in all_instances:
+            fname = safe_family_name(doc, inst) or ""
+            key = inst.Id.IntegerValue
+            if key in panel_tree_ids:
+                continue
+            # If any of its sub-components are in the tree, it's an ancestor
+            try:
+                for sid in inst.GetSubComponentIds():
+                    if sid.IntegerValue in panel_tree_ids:
+                        panel_tree_ids |= _collect_all_descendants(doc, inst)
+                        break
+            except Exception:
+                pass
+
+        # ── Pass 2: stamp "Not A Panel" on everything else ───────
+        nap_count = _stamp_non_panels(doc, active_view, panel_tree_ids, errors)
+        stats["nap_stamped"] = nap_count
+        if nap_count:
+            print("---")
+            print("'Not A Panel' stamped on {} element(s)".format(nap_count))
+
         t.Commit()
     except Exception as ex:
         # Never leave a transaction open — Revit discards everything and
@@ -129,8 +240,8 @@ def assign_panel_ids(doc, active_view):
         return stats
 
     print("---")
-    print("Panels found: {} | Tagged: {} | Nested tagged: {} | Errors: {}".format(
-        len(panels), tagged, nested_tagged, len(errors)))
+    print("Panels found: {} | Tagged: {} | Nested tagged: {} | NAP: {} | Errors: {}".format(
+        len(panels), tagged, nested_tagged, nap_count, len(errors)))
     for e in errors:
         print(e)
 
