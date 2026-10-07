@@ -160,9 +160,11 @@ def assign_panel_ids(doc, active_view):
     nested_tagged = 0
     errors = stats["errors"]
 
-    # Build the "panel tree" — every ElementId that is a panel, a host
-    # containing a panel, or a sub-component of a panel. These should NOT
-    # get the "Not A Panel" stamp.
+    # Build the "panel tree" — elements that should NOT get "Not A Panel".
+    # Strategy: protect each panel + its descendants (rebar/angles inside it),
+    # then walk UP via SuperComponent to protect each direct ancestor element
+    # (host, segment, container) WITHOUT pulling in their other children.
+    # This ensures sibling hosts (card hosts, spare angles) are NOT protected.
     panel_tree_ids = set()
 
     # Manual transaction (PyRevit CPython — no TransactionManager)
@@ -175,14 +177,19 @@ def assign_panel_ids(doc, active_view):
             fname = safe_family_name(doc, panel) or ""
             tname = safe_type_name(panel)
 
-            # Collect the full descendant tree of this panel
+            # Protect the panel and everything nested inside it
             panel_tree_ids |= _collect_all_descendants(doc, panel)
 
-            # Also include the host of this panel (if it's a nested panel)
+            # Walk UP via SuperComponent — protect each ancestor element
+            # itself (host → segment → container) but NOT their siblings.
             try:
-                host = panel.SuperComponent
-                if host is not None:
-                    panel_tree_ids |= _collect_all_descendants(doc, host)
+                ancestor = panel.SuperComponent
+                while ancestor is not None:
+                    panel_tree_ids.add(ancestor.Id.IntegerValue)
+                    try:
+                        ancestor = ancestor.SuperComponent
+                    except Exception:
+                        ancestor = None
             except Exception:
                 pass
 
@@ -202,22 +209,6 @@ def assign_panel_ids(doc, active_view):
                             sub_fname = safe_family_name(doc, sub_elem) or ""
                             print("  └─ nested: {} -> {} [{}]".format(
                                 panel_id, sub_elem.Id, sub_fname))
-
-        # Also walk up to any outer containers (HEC_EF-DUCTBANK_STANDARD_*)
-        # that parent the hosts — they should stay blank, not get stamped.
-        for inst in all_instances:
-            fname = safe_family_name(doc, inst) or ""
-            key = inst.Id.IntegerValue
-            if key in panel_tree_ids:
-                continue
-            # If any of its sub-components are in the tree, it's an ancestor
-            try:
-                for sid in inst.GetSubComponentIds():
-                    if sid.IntegerValue in panel_tree_ids:
-                        panel_tree_ids |= _collect_all_descendants(doc, inst)
-                        break
-            except Exception:
-                pass
 
         # ── Pass 2: stamp "Not A Panel" on everything else ───────
         nap_count = _stamp_non_panels(doc, active_view, panel_tree_ids, errors)

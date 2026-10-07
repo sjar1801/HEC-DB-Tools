@@ -51,6 +51,32 @@ def is_nested_panel(doc, elem):
     return tname in NESTED_PANEL_FAMILIES
 
 
+def is_panel(doc, elem):
+    """True if *elem* is a real panel (a leaf we should tag/document).
+
+    A panel is recognised by:
+      * family name in CUSTOM_PANEL_FAMILIES  (custom builds — the element IS
+        the panel), OR
+      * family OR type name in NESTED_PANEL_FAMILIES  (standard builds — the
+        nested DB_PANEL_* leaf; note some host families such as
+        HEC_NESTED_EF-DB_FSP expose the panel via their *type* name
+        DB_PANEL_FIXED, so we must check both).
+
+    Wrappers (outer HEC_EF-DUCTBANK_STANDARD_* containers, _1020F straight
+    segments, and pure host frames that only contain a separate nested panel)
+    are NOT panels — the recursive collector descends through them.
+    """
+    fname = safe_family_name(doc, elem) or ""
+    if fname in CUSTOM_PANEL_FAMILIES:
+        return True
+    if fname in NESTED_PANEL_FAMILIES:
+        return True
+    tname = safe_type_name(elem) or ""
+    if tname in NESTED_PANEL_FAMILIES:
+        return True
+    return False
+
+
 def has_geometry(elem, tol=0.001):
     """True if the element has a real (non-degenerate) model bounding box.
 
@@ -76,48 +102,73 @@ def has_geometry(elem, tol=0.001):
     return sum(1 for d in (dx, dy, dz) if d > tol) >= 2
 
 
-def panels_from_host(doc, host, verbose=True):
-    """Walk one level into a standard host family and return its nested
-    panels. If the host contains no recognised nested panel, the host itself
-    is returned as the panel (preserves pre-nesting behaviour for hosts that
-    only contain bars/angles).
+def _find_panels_recursive(doc, elem, found, visited, verbose=True, depth=0):
+    """Recursively descend through sub-components looking for real panels.
 
-    Nested panel slots that are hidden/inactive in the family (no geometry)
-    are skipped — see has_geometry()."""
-    host_name = safe_family_name(doc, host) or "?"
-    found = []
-    skipped = 0
-    for se in _sub_elements(doc, host):
-        if isinstance(se, FamilyInstance) and is_nested_panel(doc, se):
-            if not has_geometry(se):
-                skipped += 1
-                if verbose:
-                    print("  host {} [{}] -> nested panel {} is inactive (no geometry) — skipped".format(
-                        host.Id, host_name, se.Id))
-                continue
-            found.append(se)
-    if found:
-        if verbose:
-            print("  host {} [{}] -> {} nested panel(s){}".format(
-                host.Id, host_name, len(found),
-                " ({} inactive skipped)".format(skipped) if skipped else ""))
-        return found
-    if verbose:
-        print("  host {} [{}] has no nested panel — treating host as panel".format(
-            host.Id, host_name))
-    return [host]
+    At each node:
+      * If it IS a recognised panel (is_panel) AND has geometry → collect it.
+      * Otherwise recurse into its sub-components.
+      * If a node has children but none are panels (e.g. pure host with only
+        bars/angles) → fall back to treating the node itself as the panel
+        (preserves pre-nesting behaviour).
+
+    Inactive nested panel slots (no geometry) are skipped — see has_geometry().
+    `visited` prevents infinite loops / duplicate processing.
+    """
+    key = elem.Id.IntegerValue
+    if key in visited:
+        return
+    visited.add(key)
+
+    # Check if this element itself is a recognised panel
+    if is_panel(doc, elem):
+        if has_geometry(elem):
+            found.append(elem)
+            if verbose and depth > 0:
+                indent = "  " * depth
+                print("{}panel {} [{}:{}]".format(
+                    indent, elem.Id,
+                    safe_family_name(doc, elem) or "?",
+                    safe_type_name(elem) or "?"))
+            return
+        else:
+            if verbose and depth > 0:
+                indent = "  " * depth
+                print("{}panel {} inactive (no geometry) — skipped".format(
+                    indent, elem.Id))
+            return
+
+    # Not a panel — recurse into sub-components
+    subs = _sub_elements(doc, elem)
+    if not subs:
+        return
+
+    before = len(found)
+    for se in subs:
+        if isinstance(se, FamilyInstance):
+            _find_panels_recursive(doc, se, found, visited, verbose, depth + 1)
+
+    # If we recursed but found nothing, treat the element itself as a panel
+    # (handles hosts that only contain bars/angles with no nested panel family)
+    if len(found) == before and has_geometry(elem):
+        fname = safe_family_name(doc, elem) or ""
+        if fname in STANDARD_HOST_FAMILIES:
+            found.append(elem)
+            if verbose:
+                indent = "  " * depth
+                print("{}host {} [{}] has no nested panel — treating as panel".format(
+                    indent, elem.Id, fname))
 
 
 def collect_panels(doc, elements_or_ids, from_assembly=False, verbose=True):
     """Return a flat list of panel FamilyInstances from a mixed element list.
 
-    Handles both ductbank build kinds transparently:
-      * CUSTOM_PANEL_FAMILIES  → the element IS the panel
-      * STANDARD_HOST_FAMILIES → walk GetSubComponentIds() one level to the
-                                 nested panels (NESTED_PANEL_FAMILIES)
-      * anything else whose sub-components include a standard host (i.e. the
-        outer HEC_EF-DUCTBANK_STANDARD_* container) → walk into those hosts.
-        This covers the case where assembly members only list the container.
+    Uses recursive descent to handle any nesting depth:
+      * Custom panels (CUSTOM_PANEL_FAMILIES) → collected directly
+      * Standard builds → recurse through containers, segments, hosts until
+        a NESTED_PANEL_FAMILIES leaf is found
+      * Works for 90° builds (3 levels), stapled straights (4 levels), and
+        any future nesting depth
 
     `elements_or_ids` may contain Elements or ElementIds. Duplicates (same
     panel reached twice) are removed, order of first appearance is kept.
@@ -125,7 +176,7 @@ def collect_panels(doc, elements_or_ids, from_assembly=False, verbose=True):
     """
     panels = []
     seen = set()
-    custom_n = host_n = container_n = 0
+    visited = set()
 
     def _add(p):
         try:
@@ -144,35 +195,16 @@ def collect_panels(doc, elements_or_ids, from_assembly=False, verbose=True):
         if elem is None or not isinstance(elem, FamilyInstance):
             continue
 
-        fname = safe_family_name(doc, elem) or ""
-
-        if fname in CUSTOM_PANEL_FAMILIES:
-            custom_n += 1
-            _add(elem)
-
-        elif fname in STANDARD_HOST_FAMILIES:
-            host_n += 1
-            for p in panels_from_host(doc, elem, verbose):
-                _add(p)
-
-        else:
-            # Possible outer container — look one level down for hosts
-            hosts = [se for se in _sub_elements(doc, elem)
-                     if isinstance(se, FamilyInstance)
-                     and (safe_family_name(doc, se) or "") in STANDARD_HOST_FAMILIES]
-            if hosts:
-                container_n += 1
-                if verbose:
-                    print("  container {} [{}] -> {} host(s)".format(
-                        elem.Id, fname, len(hosts)))
-                for h in hosts:
-                    for p in panels_from_host(doc, h, verbose):
-                        _add(p)
+        # Recurse into this element to find all panels within it
+        found_here = []
+        _find_panels_recursive(doc, elem, found_here, visited, verbose)
+        for p in found_here:
+            _add(p)
 
     if verbose:
-        print("collect_panels{}: custom={} hosts={} containers={} -> {} panel(s)".format(
+        print("collect_panels{}: {} panel(s) from {} input element(s)".format(
             " (assembly members)" if from_assembly else "",
-            custom_n, host_n, container_n, len(panels)))
+            len(panels), len(list(elements_or_ids))))
     return panels
 
 
@@ -261,50 +293,53 @@ def collect_section_views(doc, assembly_id):
 
 
 def find_panel_in_view(doc, view):
-    """Return the host panel FamilyInstance shown in this section view.
+    """Return the real panel FamilyInstance shown in this section view.
 
-    The host panel is the instance with the MOST sub-components. If several
-    hosts are visible, prefer the one whose Comments equals the view name.
+    Uses the recursive collector to find all panels visible in the view,
+    then picks the one whose Comments matches the view name (i.e. the
+    Panel-XXX tag set by Tool 1). Falls back to the first panel found.
 
-    Standard ductbanks: the winner by sub-component count is usually the
-    HOST family (HEC_NESTED_EF-DB_*), not the real panel. In that case we walk
-    one level into the host and return the nested panel whose Comments matches
-    the view name (falling back to the first recognised nested panel).
+    This handles any nesting depth (custom, 90° 3-level, straight 4-level).
     """
     collector = (FilteredElementCollector(doc, view.Id)
                  .OfClass(FamilyInstance)
                  .WhereElementIsNotElementType())
-    hosts = []
-    for fi in collector:
-        try:
-            n = len(list(fi.GetSubComponentIds()))
-        except Exception:
-            n = 0
-        if n > 0:
-            hosts.append((n, fi))
-    if not hosts:
-        return None
+    all_fi = list(collector.ToElements())
 
-    named = [h for h in hosts if comments_of(h[1]) == view.Name]
-    if named:
-        hosts = named
-    hosts.sort(key=lambda h: h[0], reverse=True)
-    winner = hosts[0][1]
+    # Use the recursive collector to find real panels at any depth
+    panels = collect_panels(doc, all_fi, verbose=False)
 
-    # ── Standard DB: winner is a host family → descend to the nested panel ──
-    wname = safe_family_name(doc, winner) or ""
-    if wname in STANDARD_HOST_FAMILIES:
-        nested = [se for se in _sub_elements(doc, winner)
-                  if isinstance(se, FamilyInstance) and is_nested_panel(doc, se)]
-        if nested:
-            by_name = [p for p in nested if comments_of(p) == view.Name]
-            chosen = by_name[0] if by_name else nested[0]
-            print("  find_panel_in_view: host {} [{}] -> nested panel {} [{}]{}".format(
-                winner.Id, wname, chosen.Id,
-                safe_family_name(doc, chosen) or safe_type_name(chosen),
-                "" if by_name else " (no Comments match — first nested)"))
-            return chosen
-        print("  find_panel_in_view: host {} [{}] has no nested panel — using host".format(
-            winner.Id, wname))
+    if not panels:
+        # Fallback: pick the element with the most sub-components
+        best = None
+        best_n = 0
+        for fi in all_fi:
+            try:
+                n = len(list(fi.GetSubComponentIds()))
+            except Exception:
+                n = 0
+            if n > best_n:
+                best_n = n
+                best = fi
+        if best:
+            print("  find_panel_in_view: no recognised panel — fallback to {} [{}]".format(
+                best.Id, safe_family_name(doc, best) or "?"))
+        return best
 
-    return winner
+    # Prefer the panel whose Comments matches the view name
+    by_name = [p for p in panels if comments_of(p) == view.Name]
+    if by_name:
+        chosen = by_name[0]
+        print("  find_panel_in_view: {} [{}:{}] (Comments match)".format(
+            chosen.Id,
+            safe_family_name(doc, chosen) or "?",
+            safe_type_name(chosen) or "?"))
+        return chosen
+
+    chosen = panels[0]
+    print("  find_panel_in_view: {} [{}:{}] (first of {} panels, no Comments match)".format(
+        chosen.Id,
+        safe_family_name(doc, chosen) or "?",
+        safe_type_name(chosen) or "?",
+        len(panels)))
+    return chosen
